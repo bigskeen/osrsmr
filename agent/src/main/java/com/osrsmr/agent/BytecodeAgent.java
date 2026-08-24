@@ -558,6 +558,18 @@ public class BytecodeAgent {
                 getLocalPlayerMethod.setAccessible(true);
                 player = getLocalPlayerMethod.invoke(client);
             } catch (Throwable ignored) {}
+            if (player == null) {
+                try {
+                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
+                    getTopView.setAccessible(true);
+                    Object topView = getTopView.invoke(client);
+                    if (topView != null) {
+                        Method getLocalPlayer = topView.getClass().getMethod("getLocalPlayer");
+                        getLocalPlayer.setAccessible(true);
+                        player = getLocalPlayer.invoke(topView);
+                    }
+                } catch (Throwable ignored) {}
+            }
 
             // Infer Logged In if player exists
             if (player != null) {
@@ -579,7 +591,7 @@ public class BytecodeAgent {
             data.append("ENGINE_STATE: ").append(stateStr).append("\n");
 
             // Player Data
-            int playerX = 0, playerY = 0;
+            int playerX = 0, playerY = 0, plane = 0;
             if (player != null) {
                 try {
                     Method getName = player.getClass().getMethod("getName");
@@ -603,13 +615,63 @@ public class BytecodeAgent {
                         getPlane.setAccessible(true);
                         playerX = (Integer) getX.invoke(wp);
                         playerY = (Integer) getY.invoke(wp);
-                        int plane = (Integer) getPlane.invoke(wp);
-                        data.append("PLAYER_X: ").append(playerX).append("\n");
-                        data.append("PLAYER_Y: ").append(playerY).append("\n");
-                        data.append("LOCATION: (").append(playerX).append(", ").append(playerY).append(", ").append(plane).append(")\n");
-                        data.append("LOCATION_STATUS: Connected\n");
+                        plane = (Integer) getPlane.invoke(wp);
                     }
                 } catch (Throwable ignored) {}
+
+                if (playerX == 0 || playerY == 0) {
+                    try {
+                        Method getLocalLocation = player.getClass().getMethod("getLocalLocation");
+                        getLocalLocation.setAccessible(true);
+                        Object lp = getLocalLocation.invoke(player);
+                        if (lp != null) {
+                            Method getX = lp.getClass().getMethod("getX");
+                            Method getY = lp.getClass().getMethod("getY");
+                            getX.setAccessible(true);
+                            getY.setAccessible(true);
+                            int lpX = (Integer) getX.invoke(lp);
+                            int lpY = (Integer) getY.invoke(lp);
+
+                            int baseX = 0, baseY = 0;
+                            try {
+                                Method getBaseX = client.getClass().getMethod("getBaseX");
+                                Method getBaseY = client.getClass().getMethod("getBaseY");
+                                getBaseX.setAccessible(true);
+                                getBaseY.setAccessible(true);
+                                baseX = (Integer) getBaseX.invoke(client);
+                                baseY = (Integer) getBaseY.invoke(client);
+                            } catch (Throwable ignored) {}
+
+                            if (baseX == 0 || baseY == 0) {
+                                try {
+                                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
+                                    getTopView.setAccessible(true);
+                                    Object topView = getTopView.invoke(client);
+                                    if (topView != null) {
+                                        Method getBaseX = topView.getClass().getMethod("getBaseX");
+                                        Method getBaseY = topView.getClass().getMethod("getBaseY");
+                                        getBaseX.setAccessible(true);
+                                        getBaseY.setAccessible(true);
+                                        baseX = (Integer) getBaseX.invoke(topView);
+                                        baseY = (Integer) getBaseY.invoke(topView);
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+
+                            if (baseX > 0 && baseY > 0) {
+                                playerX = baseX + (lpX >> 7);
+                                playerY = baseY + (lpY >> 7);
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+
+                if (playerX > 0 && playerY > 0) {
+                    data.append("PLAYER_X: ").append(playerX).append("\n");
+                    data.append("PLAYER_Y: ").append(playerY).append("\n");
+                    data.append("LOCATION: (").append(playerX).append(", ").append(playerY).append(", ").append(plane).append(")\n");
+                    data.append("LOCATION_STATUS: Connected\n");
+                }
 
                 try {
                     Method getAnimation = player.getClass().getMethod("getAnimation");
@@ -670,6 +732,49 @@ public class BytecodeAgent {
                 if (world > 0) {
                     if (world < 300) world += 300;
                     data.append("WORLD: ").append(world).append("\n");
+                }
+            } catch (Throwable ignored) {}
+
+            // Current Tab
+            try {
+                int tab = -1;
+                try {
+                    Method getVarc = client.getClass().getMethod("getVarcIntValue", int.class);
+                    getVarc.setAccessible(true);
+                    tab = (Integer) getVarc.invoke(client, 171);
+                } catch (Throwable t1) {
+                    try {
+                        Method getVarc = client.getClass().getMethod("getVarcInt", int.class);
+                        getVarc.setAccessible(true);
+                        tab = (Integer) getVarc.invoke(client, 171);
+                    } catch (Throwable t2) {
+                        try {
+                            Method getVar = client.getClass().getMethod("getVar", int.class);
+                            getVar.setAccessible(true);
+                            tab = (Integer) getVar.invoke(client, 171);
+                        } catch (Throwable t3) {
+                            for (Method m : client.getClass().getMethods()) {
+                                if ((m.getName().equals("getVar") || m.getName().equals("getVarcIntValue")) && m.getParameterCount() == 1) {
+                                    Class<?> pType = m.getParameterTypes()[0];
+                                    if (pType.isEnum()) {
+                                        for (Object ec : pType.getEnumConstants()) {
+                                            if (ec.toString().contains("INVENTORY_TAB") || ec.toString().contains("TAB")) {
+                                                try {
+                                                    m.setAccessible(true);
+                                                    tab = (Integer) m.invoke(client, ec);
+                                                    if (tab >= 0 && tab <= 14) break;
+                                                } catch (Throwable ignored) {}
+                                            }
+                                        }
+                                    }
+                                }
+                                if (tab >= 0 && tab <= 14) break;
+                            }
+                        }
+                    }
+                }
+                if (tab >= 0 && tab <= 14) {
+                    data.append("CURRENT_TAB: ").append(tab).append("\n");
                 }
             } catch (Throwable ignored) {}
 
@@ -769,63 +874,128 @@ public class BytecodeAgent {
 
     private static void readRuneLiteItemContainer(Object client, int containerId, String prefix, int maxItems, StringBuilder data) {
         try {
-            Method getItemContainer = null;
+            Object container = null;
+
+            // Attempt 1: getItemContainer(int) or getItemContainer(InventoryID)
             for (Method m : client.getClass().getMethods()) {
                 if (m.getName().equals("getItemContainer") && m.getParameterCount() == 1) {
-                    getItemContainer = m;
-                    break;
-                }
-            }
-
-            if (getItemContainer != null) {
-                getItemContainer.setAccessible(true);
-                Object container = null;
-                try {
-                    container = getItemContainer.invoke(client, containerId);
-                } catch (Throwable t) {
-                    // Try passing enum if parameter is InventoryID
-                    Class<?> paramType = getItemContainer.getParameterTypes()[0];
-                    if (paramType.isEnum()) {
-                        for (Object enumConst : paramType.getEnumConstants()) {
+                    Class<?> pType = m.getParameterTypes()[0];
+                    if (pType == int.class || pType == Integer.class) {
+                        try {
+                            m.setAccessible(true);
+                            container = m.invoke(client, containerId);
+                            if (container != null) break;
+                        } catch (Throwable ignored) {}
+                    } else if (pType.isEnum()) {
+                        for (Object enumConst : pType.getEnumConstants()) {
                             try {
                                 Method getId = enumConst.getClass().getMethod("getId");
+                                getId.setAccessible(true);
                                 int id = (Integer) getId.invoke(enumConst);
                                 if (id == containerId) {
-                                    container = getItemContainer.invoke(client, enumConst);
+                                    m.setAccessible(true);
+                                    container = m.invoke(client, enumConst);
                                     break;
                                 }
                             } catch (Throwable ignored) {}
                         }
+                        if (container != null) break;
                     }
                 }
+            }
 
-                if (container != null) {
-                    Method getItems = container.getClass().getMethod("getItems");
-                    getItems.setAccessible(true);
-                    Object[] items = (Object[]) getItems.invoke(container);
-                    if (items != null) {
-                        for (int i = 0; i < maxItems; i++) {
-                            if (i < items.length && items[i] != null) {
-                                Object item = items[i];
+            // Attempt 2: getItemContainers() or table scan
+            if (container == null) {
+                try {
+                    for (Method m : client.getClass().getMethods()) {
+                        if (m.getName().startsWith("getItemContainer") && m.getParameterCount() == 0) {
+                            m.setAccessible(true);
+                            Object res = m.invoke(client);
+                            if (res instanceof Map) {
+                                container = ((Map<?, ?>) res).get(containerId);
+                                if (container != null) break;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            if (container != null) {
+                Method getItems = container.getClass().getMethod("getItems");
+                getItems.setAccessible(true);
+                Object itemsObj = getItems.invoke(container);
+                Object[] items = null;
+                if (itemsObj instanceof Object[]) {
+                    items = (Object[]) itemsObj;
+                } else if (itemsObj instanceof Collection) {
+                    items = ((Collection<?>) itemsObj).toArray();
+                }
+
+                if (items != null) {
+                    for (int i = 0; i < maxItems; i++) {
+                        if (i < items.length && items[i] != null) {
+                            Object item = items[i];
+                            int id = -1;
+                            int qty = 0;
+                            try {
                                 Method getId = item.getClass().getMethod("getId");
-                                Method getQty = item.getClass().getMethod("getQuantity");
                                 getId.setAccessible(true);
+                                id = (Integer) getId.invoke(item);
+                            } catch (Throwable ignored) {}
+                            try {
+                                Method getQty = item.getClass().getMethod("getQuantity");
                                 getQty.setAccessible(true);
-                                int id = (Integer) getId.invoke(item);
-                                int qty = (Integer) getQty.invoke(item);
-                                if (id > 0) {
-                                    data.append(prefix).append("[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
+                                qty = (Integer) getQty.invoke(item);
+                            } catch (Throwable ignored) {}
+
+                            if (id > 0 && id != 65535) {
+                                String name = resolveItemName(client, id);
+                                if (name != null && !name.isEmpty() && !name.equalsIgnoreCase("null")) {
+                                    data.append(prefix).append("[").append(i).append("]: ").append(name).append(",").append(qty).append("\n");
                                 } else {
-                                    data.append(prefix).append("[").append(i).append("]: 0,0\n");
+                                    data.append(prefix).append("[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
                                 }
                             } else {
                                 data.append(prefix).append("[").append(i).append("]: 0,0\n");
                             }
+                        } else {
+                            data.append(prefix).append("[").append(i).append("]: 0,0\n");
                         }
                     }
+                    return;
                 }
             }
         } catch (Throwable ignored) {}
+
+        // Fallback: output empty slots
+        for (int i = 0; i < maxItems; i++) {
+            data.append(prefix).append("[").append(i).append("]: 0,0\n");
+        }
+    }
+
+    private static String resolveItemName(Object client, int id) {
+        if (id <= 0 || client == null) return null;
+        try {
+            for (String mName : new String[]{"getItemDefinition", "getItemComposition"}) {
+                try {
+                    Method m = client.getClass().getMethod(mName, int.class);
+                    m.setAccessible(true);
+                    Object def = m.invoke(client, id);
+                    if (def != null) {
+                        Method getName = def.getClass().getMethod("getName");
+                        getName.setAccessible(true);
+                        Object n = getName.invoke(def);
+                        if (n instanceof String) {
+                            String s = ((String) n).replaceAll("<[^>]*>", "").trim();
+                            if (!s.isEmpty() && !s.equalsIgnoreCase("null")) {
+                                return s;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private static void appendRuneLiteNpc(Object client, Object npc, int index, int playerX, int playerY, StringBuilder data) {

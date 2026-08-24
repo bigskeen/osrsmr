@@ -415,7 +415,7 @@ public partial class MainWindow : Window
 
     private void UpdateEquipmentSlot(string key, string value)
     {
-        // Format: EQUIP[slotId]: ID, Quantity
+        // Format: EQUIP[slotId]: ID, Quantity or Name, Quantity
         try
         {
             int openBracket = key.IndexOf('[');
@@ -425,19 +425,28 @@ public partial class MainWindow : Window
                 string slotId = key.Substring(openBracket + 1, closeBracket - openBracket - 1);
                 if (_equipmentSlots.TryGetValue(slotId, out var border))
                 {
-                    if (value == "0" || string.IsNullOrEmpty(value) || value == "-1")
+                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "0,0" || value.StartsWith("0,"))
                     {
                         border.Background = new SolidColorBrush(Color.FromRgb(42, 42, 42));
                         border.Child = null;
                     }
                     else
                     {
+                        var parts = value.Split(',');
+                        string displayText = parts[0].Trim();
+                        if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int qty) && qty > 1)
+                        {
+                            displayText = $"{displayText} ({qty})";
+                        }
+
                         border.Background = new SolidColorBrush(Color.FromRgb(0, 100, 150));
                         border.Child = new TextBlock
                         {
-                            Text = value.Split(',')[0],
+                            Text = displayText,
                             FontSize = 8,
                             Foreground = Brushes.White,
+                            TextWrapping = TextWrapping.Wrap,
+                            TextAlignment = TextAlignment.Center,
                             HorizontalAlignment = HorizontalAlignment.Center,
                             VerticalAlignment = VerticalAlignment.Center
                         };
@@ -450,7 +459,7 @@ public partial class MainWindow : Window
 
     private void UpdateInventorySlot(string key, string value)
     {
-        // Format: INV[0]: ID, Quantity
+        // Format: INV[0]: ID, Quantity or Name, Quantity
         try
         {
             int openBracket = key.IndexOf('[');
@@ -460,19 +469,28 @@ public partial class MainWindow : Window
                 int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
                 if (index >= 0 && index < 28)
                 {
-                    if (value == "0" || string.IsNullOrEmpty(value) || value == "-1")
+                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "0,0" || value.StartsWith("0,"))
                     {
                         _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128));
                         _inventorySlots[index].Child = null;
                     }
                     else
                     {
+                        var parts = value.Split(',');
+                        string displayText = parts[0].Trim();
+                        if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int qty) && qty > 1)
+                        {
+                            displayText = $"{displayText} ({qty})";
+                        }
+
                         _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(100, 0, 122, 204));
                         _inventorySlots[index].Child = new TextBlock 
                         { 
-                            Text = value.Split(',')[0], 
+                            Text = displayText, 
                             FontSize = 8, 
                             Foreground = Brushes.White,
+                            TextWrapping = TextWrapping.Wrap,
+                            TextAlignment = TextAlignment.Center,
                             HorizontalAlignment = HorizontalAlignment.Center,
                             VerticalAlignment = VerticalAlignment.Center
                         };
