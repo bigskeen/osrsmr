@@ -9,7 +9,9 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class BytecodeAgent {
@@ -917,6 +919,10 @@ public class BytecodeAgent {
             readRuneLiteItemContainer(client, 93, "INV", 28, data);
             readRuneLiteItemContainer(client, 94, "EQUIP", 14, data);
 
+            // Magic & Prayers
+            processRuneLiteMagic(client, data);
+            processRuneLitePrayers(client, data);
+
             // NPCs
             try {
                 Object npcsObj = null;
@@ -1046,6 +1052,262 @@ public class BytecodeAgent {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    private static final String[] STANDARD_PRAYER_NAMES = {
+        "Thick Skin", "Burst of Strength", "Clarity of Thought", "Sharp Eye", "Mystic Will",
+        "Rock Skin", "Superhuman Strength", "Improved Reflexes", "Rapid Restore", "Rapid Heal",
+        "Protect Item", "Hawk Eye", "Mystic Lore", "Steel Skin", "Ultimate Strength",
+        "Incredible Reflexes", "Protect from Magic", "Protect from Missiles", "Protect from Melee",
+        "Eagle Eye", "Mystic Might", "Retribution", "Redemption", "Smite",
+        "Preserve", "Chivalry", "Piety", "Rigour", "Augury"
+    };
+
+    private static int getVarbitValue(Object client, int varbitId) {
+        if (client == null || varbitId < 0) return -1;
+        for (String mName : new String[]{"getVarbitValue", "getVarbit", "getVar"}) {
+            try {
+                Method m = client.getClass().getMethod(mName, int.class);
+                m.setAccessible(true);
+                Object res = m.invoke(client, varbitId);
+                if (res instanceof Number) {
+                    return ((Number) res).intValue();
+                }
+            } catch (Throwable ignored) {}
+        }
+        return -1;
+    }
+
+    private static int getVarpValue(Object client, int varpId) {
+        if (client == null || varpId < 0) return -1;
+        for (String mName : new String[]{"getVarpValue", "getVarp", "getVarpValueInt", "getVar"}) {
+            try {
+                Method m = client.getClass().getMethod(mName, int.class);
+                m.setAccessible(true);
+                Object res = m.invoke(client, varpId);
+                if (res instanceof Number) {
+                    return ((Number) res).intValue();
+                }
+            } catch (Throwable ignored) {}
+        }
+        return -1;
+    }
+
+    private static String getAutocastSpellName(int id) {
+        switch (id) {
+            case 1: return "Wind Strike";
+            case 2: return "Water Strike";
+            case 3: return "Earth Strike";
+            case 4: return "Fire Strike";
+            case 5: return "Wind Bolt";
+            case 6: return "Water Bolt";
+            case 7: return "Earth Bolt";
+            case 8: return "Fire Bolt";
+            case 9: return "Wind Blast";
+            case 10: return "Water Blast";
+            case 11: return "Earth Blast";
+            case 12: return "Fire Blast";
+            case 13: return "Wind Wave";
+            case 14: return "Water Wave";
+            case 15: return "Earth Wave";
+            case 16: return "Fire Wave";
+            case 17: return "Crumble Undead";
+            case 18: return "Iban Blast";
+            case 19: return "Magic Dart";
+            case 20: return "Saradomin Strike";
+            case 21: return "Claws of Guthix";
+            case 22: return "Flames of Zamorak";
+            case 23: return "Slayer Dart";
+            case 31: return "Smoke Rush";
+            case 32: return "Shadow Rush";
+            case 33: return "Blood Rush";
+            case 34: return "Ice Rush";
+            case 35: return "Smoke Burst";
+            case 36: return "Shadow Burst";
+            case 37: return "Blood Burst";
+            case 38: return "Ice Burst";
+            case 39: return "Smoke Blitz";
+            case 40: return "Shadow Blitz";
+            case 41: return "Blood Blitz";
+            case 42: return "Ice Blitz";
+            case 43: return "Smoke Barrage";
+            case 44: return "Shadow Barrage";
+            case 45: return "Blood Barrage";
+            case 46: return "Ice Barrage";
+            case 48: return "Wind Surge";
+            case 49: return "Water Surge";
+            case 50: return "Earth Surge";
+            case 51: return "Fire Surge";
+            case 52: return "Infernal Teleport";
+            case 53: return "Ghostly Grasp";
+            case 54: return "Skeletal Grasp";
+            case 55: return "Undead Grasp";
+            case 56: return "Infernal Grasp";
+            default: return id > 0 ? ("Spell #" + id) : "None";
+        }
+    }
+
+    private static String formatEnumPrayerName(String enumName) {
+        if (enumName == null) return "";
+        String[] parts = enumName.toLowerCase().split("_");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.length; i++) {
+            String p = parts[i];
+            if (p.isEmpty()) continue;
+            if (i > 0) {
+                sb.append(" ");
+                if (p.equals("from") || p.equals("of")) {
+                    sb.append(p);
+                    continue;
+                }
+            }
+            sb.append(Character.toUpperCase(p.charAt(0))).append(p.substring(1));
+        }
+        return sb.toString();
+    }
+
+    private static void processRuneLiteMagic(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            // 1. Spellbook (Varbit 4070)
+            int spellbookId = getVarbitValue(client, 4070);
+            String spellbookName;
+            switch (spellbookId) {
+                case 0: spellbookName = "Standard"; break;
+                case 1: spellbookName = "Ancient Magicks"; break;
+                case 2: spellbookName = "Lunar"; break;
+                case 3: spellbookName = "Arceuus"; break;
+                default: spellbookName = spellbookId >= 0 ? ("Spellbook " + spellbookId) : "Standard"; break;
+            }
+            data.append("SPELLBOOK: ").append(spellbookName).append("\n");
+            if (spellbookId >= 0) {
+                data.append("SPELLBOOK_ID: ").append(spellbookId).append("\n");
+            }
+
+            // 2. Autocast Spell (VarPlayer 276)
+            int autocastId = getVarpValue(client, 276);
+            String autocastName = getAutocastSpellName(autocastId);
+            data.append("AUTOCAST_SPELL: ").append(autocastName).append("\n");
+            if (autocastId >= 0) {
+                data.append("AUTOCAST_ID: ").append(autocastId).append("\n");
+            }
+
+            // 3. Selected / Targeting Spell (e.g. client.getSelectedSpellName())
+            String selectedSpell = null;
+            try {
+                Method getSel = client.getClass().getMethod("getSelectedSpellName");
+                getSel.setAccessible(true);
+                Object res = getSel.invoke(client);
+                if (res instanceof String) {
+                    String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                    if (!s.isEmpty()) {
+                        selectedSpell = s;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            if (selectedSpell != null) {
+                data.append("SELECTED_SPELL: ").append(selectedSpell).append("\n");
+            } else {
+                data.append("SELECTED_SPELL: None\n");
+            }
+
+            // 4. Spell Selected boolean
+            boolean isSpellSelected = false;
+            try {
+                Method getSpellSel = client.getClass().getMethod("getSpellSelected");
+                getSpellSel.setAccessible(true);
+                Object res = getSpellSel.invoke(client);
+                if (res instanceof Boolean) {
+                    isSpellSelected = (Boolean) res;
+                }
+            } catch (Throwable ignored) {}
+            data.append("SPELL_SELECTED: ").append(isSpellSelected ? "1" : "0").append("\n");
+        } catch (Throwable ignored) {}
+    }
+
+    private static void processRuneLitePrayers(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            // 1. Quick Prayer (Varbit 4103)
+            int quickPrayer = getVarbitValue(client, 4103);
+            data.append("QUICK_PRAYER: ").append(quickPrayer == 1 ? "Active" : "Inactive").append("\n");
+            data.append("QUICK_PRAYER_VALUE: ").append(quickPrayer).append("\n");
+
+            // 2. Active Prayers Detection
+            List<String> activePrayers = new ArrayList<>();
+            Map<String, Boolean> prayerStatus = new LinkedHashMap<>();
+
+            // Initialize all with false
+            for (String pName : STANDARD_PRAYER_NAMES) {
+                prayerStatus.put(pName, false);
+            }
+
+            // Try RuneLite client.isPrayerActive(Prayer) method
+            boolean usedRuneLiteEnum = false;
+            try {
+                ClassLoader cl = client.getClass().getClassLoader();
+                Class<?> prayerClass = null;
+                try {
+                    prayerClass = Class.forName("net.runelite.api.Prayer", true, cl);
+                } catch (Throwable t) {
+                    for (Method m : client.getClass().getMethods()) {
+                        if (m.getName().equals("isPrayerActive") && m.getParameterCount() == 1) {
+                            prayerClass = m.getParameterTypes()[0];
+                            break;
+                        }
+                    }
+                }
+
+                if (prayerClass != null && prayerClass.isEnum()) {
+                    Method isPrayerActive = client.getClass().getMethod("isPrayerActive", prayerClass);
+                    isPrayerActive.setAccessible(true);
+                    for (Object pConst : prayerClass.getEnumConstants()) {
+                        String enumName = pConst.toString();
+                        String formattedName = formatEnumPrayerName(enumName);
+                        boolean isActive = (Boolean) isPrayerActive.invoke(client, pConst);
+                        prayerStatus.put(formattedName, isActive);
+                        if (isActive) {
+                            activePrayers.add(formattedName);
+                        }
+                    }
+                    usedRuneLiteEnum = true;
+                }
+            } catch (Throwable ignored) {}
+
+            // Fallback / complement with VarPlayer 83 bitmask
+            if (!usedRuneLiteEnum) {
+                int prayerMask = getVarpValue(client, 83); // VarPlayer.PRAYER_ACTIVE = 83
+                if (prayerMask >= 0) {
+                    for (int i = 0; i < STANDARD_PRAYER_NAMES.length; i++) {
+                        String pName = STANDARD_PRAYER_NAMES[i];
+                        boolean isActive = (prayerMask & (1 << i)) != 0;
+                        prayerStatus.put(pName, isActive);
+                        if (isActive) {
+                            activePrayers.add(pName);
+                        }
+                    }
+                }
+            }
+
+            // Telemetry: Active Prayers Summary
+            if (activePrayers.isEmpty()) {
+                data.append("ACTIVE_PRAYERS: None\n");
+            } else {
+                StringBuilder activeSb = new StringBuilder();
+                for (int i = 0; i < activePrayers.size(); i++) {
+                    if (i > 0) activeSb.append(", ");
+                    activeSb.append(activePrayers.get(i));
+                }
+                data.append("ACTIVE_PRAYERS: ").append(activeSb.toString()).append("\n");
+            }
+            data.append("ACTIVE_PRAYER_COUNT: ").append(activePrayers.size()).append("\n");
+
+            // Telemetry: Individual prayer statuses
+            for (Map.Entry<String, Boolean> entry : prayerStatus.entrySet()) {
+                data.append("PRAYER[").append(entry.getKey()).append("]: ")
+                    .append(entry.getValue() ? "1" : "0").append("\n");
+            }
+        } catch (Throwable ignored) {}
     }
 
     private static void readRuneLiteItemContainer(Object client, int containerId, String prefix, int maxItems, StringBuilder data) {

@@ -20,6 +20,8 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<DataItem> _skills = new();
     private readonly ObservableCollection<NpcItem> _npcs = new();
     private readonly ObservableCollection<PlayerItem> _players = new();
+    private readonly ObservableCollection<PrayerViewModel> _prayers = new();
+    private readonly Dictionary<string, PrayerViewModel> _prayerMap = new(StringComparer.OrdinalIgnoreCase);
     private readonly Border[] _inventorySlots = new Border[28];
     private readonly Dictionary<string, Border> _equipmentSlots = new();
     private TcpListener? _listener;
@@ -52,6 +54,7 @@ public partial class MainWindow : Window
             SkillsControl.ItemsSource = _skills;
             NpcList.ItemsSource = _npcs;
             PlayerList.ItemsSource = _players;
+            InitializePrayers();
             InitializeInventoryGrid();
             InitializeEquipmentMapping();
             StartServer();
@@ -82,6 +85,27 @@ public partial class MainWindow : Window
         _equipmentSlots["10"] = Equip_Feet;
         _equipmentSlots["12"] = Equip_Ring;
         _equipmentSlots["13"] = Equip_Ammo;
+    }
+
+    private void InitializePrayers()
+    {
+        string[] standardPrayers = {
+            "Thick Skin", "Burst of Strength", "Clarity of Thought", "Sharp Eye", "Mystic Will",
+            "Rock Skin", "Superhuman Strength", "Improved Reflexes", "Rapid Restore", "Rapid Heal",
+            "Protect Item", "Hawk Eye", "Mystic Lore", "Steel Skin", "Ultimate Strength",
+            "Incredible Reflexes", "Protect from Magic", "Protect from Missiles", "Protect from Melee",
+            "Eagle Eye", "Mystic Might", "Retribution", "Redemption", "Smite",
+            "Preserve", "Chivalry", "Piety", "Rigour", "Augury"
+        };
+
+        foreach (var p in standardPrayers)
+        {
+            var vm = new PrayerViewModel { Name = p, IsActive = false };
+            _prayers.Add(vm);
+            _prayerMap[p] = vm;
+        }
+
+        PrayersControl.ItemsSource = _prayers;
     }
 
     private void InitializeInventoryGrid()
@@ -342,6 +366,44 @@ public partial class MainWindow : Window
                 {
                     UpdateCurrentTab(value);
                 }
+                else if (key.StartsWith("PRAYER["))
+                {
+                    UpdatePrayerStatus(key, value);
+                }
+                else if (key == "SPELLBOOK")
+                {
+                    UpdateSpellbook(value);
+                }
+                else if (key == "AUTOCAST_SPELL")
+                {
+                    AutocastSpellText.Text = value;
+                    if (value != "None" && !string.IsNullOrWhiteSpace(value))
+                    {
+                        AutocastBadge.Background = new SolidColorBrush(Color.FromRgb(30, 45, 65));
+                        AutocastSpellText.Foreground = new SolidColorBrush(Color.FromRgb(130, 170, 255));
+                    }
+                    else
+                    {
+                        AutocastBadge.Background = new SolidColorBrush(Color.FromRgb(42, 42, 58));
+                        AutocastSpellText.Foreground = Brushes.Gray;
+                    }
+                }
+                else if (key == "SELECTED_SPELL")
+                {
+                    SelectedSpellText.Text = value;
+                }
+                else if (key == "QUICK_PRAYER")
+                {
+                    UpdateQuickPrayer(value);
+                }
+                else if (key == "ACTIVE_PRAYERS")
+                {
+                    ActivePrayersListText.Text = value;
+                }
+                else if (key == "ACTIVE_PRAYER_COUNT")
+                {
+                    ActivePrayerCountText.Text = $"{value} Active";
+                }
                 else if (key == "LOCATION_STATUS")
                 {
                     var existing = _dataItems.FirstOrDefault(i => i.Key == key);
@@ -380,6 +442,69 @@ public partial class MainWindow : Window
         {
             ActiveTabText.Text = value;
         }
+    }
+
+    private void UpdateSpellbook(string value)
+    {
+        SpellbookText.Text = value;
+        switch (value.ToLowerInvariant())
+        {
+            case "standard":
+                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(30, 57, 42));
+                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(76, 175, 80));
+                break;
+            case "ancient magicks":
+            case "ancient":
+                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(50, 30, 65));
+                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(186, 104, 200));
+                break;
+            case "lunar":
+                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(25, 45, 70));
+                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(100, 181, 246));
+                break;
+            case "arceuus":
+                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(65, 45, 25));
+                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(255, 183, 77));
+                break;
+            default:
+                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(40, 40, 40));
+                SpellbookText.Foreground = Brushes.White;
+                break;
+        }
+    }
+
+    private void UpdateQuickPrayer(string value)
+    {
+        bool isActive = (value == "1" || value.Equals("Active", StringComparison.OrdinalIgnoreCase));
+        QuickPrayerText.Text = isActive ? "Active" : "Inactive";
+        if (isActive)
+        {
+            QuickPrayerBadge.Background = new SolidColorBrush(Color.FromRgb(20, 60, 40));
+            QuickPrayerText.Foreground = new SolidColorBrush(Color.FromRgb(0, 230, 118));
+        }
+        else
+        {
+            QuickPrayerBadge.Background = new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            QuickPrayerText.Foreground = Brushes.Gray;
+        }
+    }
+
+    private void UpdatePrayerStatus(string key, string value)
+    {
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                string prayerName = key.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim();
+                if (_prayerMap.TryGetValue(prayerName, out var pvm))
+                {
+                    pvm.IsActive = (value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase));
+                }
+            }
+        }
+        catch { }
     }
 
     private void UpdateSkill(string key, string value)
@@ -1254,6 +1379,54 @@ public class PlayerItem
     public string Name { get; set; } = "";
     public string Distance { get; set; } = "";
     public string CombatLevel { get; set; } = "";
+}
+
+public class PrayerViewModel : System.ComponentModel.INotifyPropertyChanged
+{
+    private string _name = "";
+    private bool _isActive;
+
+    public string Name
+    {
+        get => _name;
+        set { _name = value; OnPropertyChanged(nameof(Name)); }
+    }
+
+    public bool IsActive
+    {
+        get => _isActive;
+        set
+        {
+            if (_isActive != value)
+            {
+                _isActive = value;
+                OnPropertyChanged(nameof(IsActive));
+                OnPropertyChanged(nameof(BackgroundBrush));
+                OnPropertyChanged(nameof(BorderBrush));
+                OnPropertyChanged(nameof(StatusBrush));
+                OnPropertyChanged(nameof(TextBrush));
+            }
+        }
+    }
+
+    public Brush BackgroundBrush => _isActive 
+        ? new SolidColorBrush(Color.FromArgb(80, 0, 180, 216)) 
+        : new SolidColorBrush(Color.FromRgb(37, 37, 38));
+
+    public Brush BorderBrush => _isActive 
+        ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) 
+        : new SolidColorBrush(Color.FromRgb(63, 63, 70));
+
+    public Brush StatusBrush => _isActive 
+        ? new SolidColorBrush(Color.FromRgb(0, 255, 128)) 
+        : new SolidColorBrush(Color.FromRgb(90, 90, 90));
+
+    public Brush TextBrush => _isActive 
+        ? Brushes.White 
+        : new SolidColorBrush(Color.FromRgb(160, 160, 160));
+
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+    protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(name));
 }
 
 public static class ItemDatabase
