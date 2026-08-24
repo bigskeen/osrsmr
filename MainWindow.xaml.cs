@@ -15,6 +15,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<DataItem> _dataItems = new();
     private readonly ObservableCollection<DataItem> _skills = new();
     private readonly ObservableCollection<NpcItem> _npcs = new();
+    private readonly ObservableCollection<PlayerItem> _players = new();
     private readonly Border[] _inventorySlots = new Border[28];
     private readonly Dictionary<string, Border> _equipmentSlots = new();
     private TcpListener? _listener;
@@ -46,6 +47,7 @@ public partial class MainWindow : Window
             DataList.ItemsSource = _dataItems;
             SkillsControl.ItemsSource = _skills;
             NpcList.ItemsSource = _npcs;
+            PlayerList.ItemsSource = _players;
             InitializeInventoryGrid();
             InitializeEquipmentMapping();
             StartServer();
@@ -212,6 +214,20 @@ public partial class MainWindow : Window
                         while (_npcs.Count > totalNpcs)
                         {
                             _npcs.RemoveAt(_npcs.Count - 1);
+                        }
+                    }
+                }
+                else if (key.StartsWith("NEARBY_PLAYER[") || key.StartsWith("PLAYER_NEARBY[") || (key.StartsWith("PLAYER[") && !key.StartsWith("PLAYER_NAME")))
+                {
+                    UpdatePlayerList(key, value);
+                }
+                else if (key == "TOTAL_PLAYERS" || key == "TOTAL_NEARBY_PLAYERS")
+                {
+                    if (int.TryParse(value, out int totalPlayers))
+                    {
+                        while (_players.Count > totalPlayers)
+                        {
+                            _players.RemoveAt(_players.Count - 1);
                         }
                     }
                 }
@@ -413,6 +429,37 @@ public partial class MainWindow : Window
         catch { }
     }
 
+    private void UpdatePlayerList(string key, string value)
+    {
+        // Format: NEARBY_PLAYER[0]: ID, Name, Distance, CombatLevel
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 4)
+                {
+                    var player = new PlayerItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Distance = parts[2].Trim(),
+                        CombatLevel = parts[3].Trim()
+                    };
+
+                    if (index < _players.Count)
+                        _players[index] = player;
+                    else
+                        _players.Add(player);
+                }
+            }
+        }
+        catch { }
+    }
+
     private void UpdateEquipmentSlot(string key, string value)
     {
         // Format: EQUIP[slotId]: ID, Quantity or Name, Quantity
@@ -428,22 +475,28 @@ public partial class MainWindow : Window
                     if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "0,0" || value.StartsWith("0,"))
                     {
                         border.Background = new SolidColorBrush(Color.FromRgb(42, 42, 42));
+                        border.ToolTip = null;
                         border.Child = null;
                     }
                     else
                     {
                         int lastComma = value.LastIndexOf(',');
                         string displayText = lastComma >= 0 ? value.Substring(0, lastComma).Trim() : value.Trim();
-                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int qty) && qty > 1)
+                        int qty = 1;
+                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int parsedQty))
                         {
-                            displayText = $"{displayText} ({qty})";
+                            qty = parsedQty;
                         }
 
+                        string toolTipText = qty > 1 ? $"{displayText} (x{qty})" : displayText;
+                        string labelText = qty > 1 ? $"{displayText}\nx{qty}" : displayText;
+
                         border.Background = new SolidColorBrush(Color.FromRgb(0, 100, 150));
+                        border.ToolTip = toolTipText;
                         border.Child = new TextBlock
                         {
-                            Text = displayText,
-                            FontSize = 8,
+                            Text = labelText,
+                            FontSize = 7.5,
                             Foreground = Brushes.White,
                             TextWrapping = TextWrapping.Wrap,
                             TextAlignment = TextAlignment.Center,
@@ -472,22 +525,28 @@ public partial class MainWindow : Window
                     if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "0,0" || value.StartsWith("0,"))
                     {
                         _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128));
+                        _inventorySlots[index].ToolTip = $"Slot {index + 1}: Empty";
                         _inventorySlots[index].Child = null;
                     }
                     else
                     {
                         int lastComma = value.LastIndexOf(',');
                         string displayText = lastComma >= 0 ? value.Substring(0, lastComma).Trim() : value.Trim();
-                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int qty) && qty > 1)
+                        int qty = 1;
+                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int parsedQty))
                         {
-                            displayText = $"{displayText} ({qty})";
+                            qty = parsedQty;
                         }
 
-                        _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(100, 0, 122, 204));
+                        string toolTipText = qty > 1 ? $"{displayText} (x{qty})" : displayText;
+                        string labelText = qty > 1 ? $"{displayText}\nx{qty}" : displayText;
+
+                        _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(140, 0, 110, 180));
+                        _inventorySlots[index].ToolTip = toolTipText;
                         _inventorySlots[index].Child = new TextBlock 
                         { 
-                            Text = displayText, 
-                            FontSize = 8, 
+                            Text = labelText, 
+                            FontSize = 7.5, 
                             Foreground = Brushes.White,
                             TextWrapping = TextWrapping.Wrap,
                             TextAlignment = TextAlignment.Center,
@@ -1179,4 +1238,12 @@ public class NpcItem
     public string Name { get; set; } = "";
     public string Distance { get; set; } = "";
     public string Health { get; set; } = "";
+}
+
+public class PlayerItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Distance { get; set; } = "";
+    public string CombatLevel { get; set; } = "";
 }

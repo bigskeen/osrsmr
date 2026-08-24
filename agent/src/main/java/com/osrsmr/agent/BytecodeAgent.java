@@ -43,6 +43,7 @@ public class BytecodeAgent {
     private static Field localPlayerField = null;
     private static Field skillsField = null;
     private static Field npcListField = null;
+    private static Field playerListField = null;
     private static Field currentTabField = null;
     private static int currentTabMultiplier = 1;
     private static Field equipmentField = null;
@@ -451,11 +452,15 @@ public class BytecodeAgent {
                             }
                         }
 
-                        // 6. NPC List array (Object[] length > 100)
-                        if (npcListField == null && f.getType().isArray() && !f.getType().getComponentType().isPrimitive()) {
+                        // 6. NPC List & Player List arrays (Object[] length > 100)
+                        if (f.getType().isArray() && !f.getType().getComponentType().isPrimitive()) {
                             Object[] arr = (Object[]) f.get(null);
                             if (arr != null && arr.length >= 100 && arr.length <= 65536) {
-                                npcListField = f;
+                                if (npcListField == null) {
+                                    npcListField = f;
+                                } else if (playerListField == null && !f.equals(npcListField)) {
+                                    playerListField = f;
+                                }
                             }
                         }
 
@@ -915,6 +920,62 @@ public class BytecodeAgent {
                 }
             } catch (Throwable ignored) {}
 
+            // Players
+            try {
+                Object playersObj = null;
+                // Check modern RuneLite WorldView first
+                try {
+                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
+                    getTopView.setAccessible(true);
+                    Object topView = getTopView.invoke(client);
+                    if (topView != null) {
+                        for (String mName : new String[]{"players", "getPlayers"}) {
+                            try {
+                                Method m = topView.getClass().getMethod(mName);
+                                m.setAccessible(true);
+                                playersObj = m.invoke(topView);
+                                if (playersObj != null) break;
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                } catch (Throwable ignored) {}
+
+                // Fallback to direct client call
+                if (playersObj == null) {
+                    for (String mName : new String[]{"getPlayers", "players"}) {
+                        try {
+                            Method m = client.getClass().getMethod(mName);
+                            m.setAccessible(true);
+                            playersObj = m.invoke(client);
+                            if (playersObj != null) break;
+                        } catch (Throwable ignored) {}
+                    }
+                }
+
+                if (playersObj != null) {
+                    int count = 0;
+                    try {
+                        if (playersObj instanceof Iterable) {
+                            for (Object p : (Iterable<?>) playersObj) {
+                                if (p != null && count < 25) {
+                                    appendRuneLitePlayer(client, p, count, playerX, playerY, player, data);
+                                    count++;
+                                }
+                            }
+                        } else if (playersObj instanceof Object[]) {
+                            Object[] pArr = (Object[]) playersObj;
+                            for (Object p : pArr) {
+                                if (p != null && count < 25) {
+                                    appendRuneLitePlayer(client, p, count, playerX, playerY, player, data);
+                                    count++;
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    data.append("TOTAL_PLAYERS: ").append(count).append("\n");
+                }
+            } catch (Throwable ignored) {}
+
             // Plane & Camera & FPS
             try {
                 Method getPlane = client.getClass().getMethod("getPlane");
@@ -935,10 +996,19 @@ public class BytecodeAgent {
     }
 
     private static void readRuneLiteItemContainer(Object client, int containerId, String prefix, int maxItems, StringBuilder data) {
+        int[] itemIds = new int[maxItems];
+        int[] itemQtys = new int[maxItems];
+        String[] itemNames = new String[maxItems];
+        for (int i = 0; i < maxItems; i++) {
+            itemIds[i] = -1;
+            itemQtys[i] = 0;
+        }
+
+        boolean found = false;
+
+        // Strategy 1: Direct client.getItemContainer(int) or client.getItemContainer(InventoryID)
         try {
             Object container = null;
-
-            // Attempt 1: getItemContainer(int) or getItemContainer(InventoryID)
             for (Method m : client.getClass().getMethods()) {
                 if (m.getName().equals("getItemContainer") && m.getParameterCount() == 1) {
                     Class<?> pType = m.getParameterTypes()[0];
@@ -951,13 +1021,23 @@ public class BytecodeAgent {
                     } else if (pType.isEnum()) {
                         for (Object enumConst : pType.getEnumConstants()) {
                             try {
-                                Method getId = enumConst.getClass().getMethod("getId");
-                                getId.setAccessible(true);
-                                int id = (Integer) getId.invoke(enumConst);
-                                if (id == containerId) {
+                                String eName = ((Enum<?>) enumConst).name();
+                                boolean match = false;
+                                if (containerId == 93 && (eName.equalsIgnoreCase("INVENTORY") || eName.contains("INV"))) match = true;
+                                if (containerId == 94 && (eName.equalsIgnoreCase("EQUIPMENT") || eName.contains("EQUIP"))) match = true;
+                                if (containerId == 95 && (eName.equalsIgnoreCase("BANK") || eName.contains("BANK"))) match = true;
+                                if (!match) {
+                                    try {
+                                        Method getId = pType.getMethod("getId");
+                                        getId.setAccessible(true);
+                                        int id = (Integer) getId.invoke(enumConst);
+                                        if (id == containerId) match = true;
+                                    } catch (Throwable ignored) {}
+                                }
+                                if (match) {
                                     m.setAccessible(true);
                                     container = m.invoke(client, enumConst);
-                                    break;
+                                    if (container != null) break;
                                 }
                             } catch (Throwable ignored) {}
                         }
@@ -966,72 +1046,240 @@ public class BytecodeAgent {
                 }
             }
 
-            // Attempt 2: getItemContainers() or table scan
+            // Strategy 2: client.getItemContainers() HashTable / Map / Collection
             if (container == null) {
-                try {
-                    for (Method m : client.getClass().getMethods()) {
-                        if (m.getName().startsWith("getItemContainer") && m.getParameterCount() == 0) {
+                for (Method m : client.getClass().getMethods()) {
+                    if (m.getName().startsWith("getItemContainer") && m.getParameterCount() == 0) {
+                        try {
                             m.setAccessible(true);
                             Object res = m.invoke(client);
-                            if (res instanceof Map) {
-                                container = ((Map<?, ?>) res).get(containerId);
-                                if (container != null) break;
+                            if (res != null) {
+                                if (res instanceof Map) {
+                                    container = ((Map<?, ?>) res).get(containerId);
+                                }
+                                if (container == null) {
+                                    try {
+                                        Method getMethod = res.getClass().getMethod("get", long.class);
+                                        getMethod.setAccessible(true);
+                                        container = getMethod.invoke(res, (long) containerId);
+                                    } catch (Throwable ignored) {}
+                                }
+                                if (container == null) {
+                                    try {
+                                        Method getMethod = res.getClass().getMethod("get", int.class);
+                                        getMethod.setAccessible(true);
+                                        container = getMethod.invoke(res, containerId);
+                                    } catch (Throwable ignored) {}
+                                }
+                                if (container == null && res instanceof Iterable) {
+                                    for (Object node : (Iterable<?>) res) {
+                                        if (node != null) {
+                                            try {
+                                                Method getId = node.getClass().getMethod("getId");
+                                                getId.setAccessible(true);
+                                                int nid = (Integer) getId.invoke(node);
+                                                if (nid == containerId) {
+                                                    container = node;
+                                                    break;
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                    }
+                                }
                             }
-                        }
+                            if (container != null) break;
+                        } catch (Throwable ignored) {}
                     }
-                } catch (Throwable ignored) {}
+                }
             }
 
             if (container != null) {
-                Method getItems = container.getClass().getMethod("getItems");
-                getItems.setAccessible(true);
-                Object itemsObj = getItems.invoke(container);
-                Object[] items = null;
-                if (itemsObj instanceof Object[]) {
-                    items = (Object[]) itemsObj;
-                } else if (itemsObj instanceof Collection) {
-                    items = ((Collection<?>) itemsObj).toArray();
-                }
+                Object itemsObj = null;
+                try {
+                    Method getItems = container.getClass().getMethod("getItems");
+                    getItems.setAccessible(true);
+                    itemsObj = getItems.invoke(container);
+                } catch (Throwable ignored) {}
 
-                if (items != null) {
-                    for (int i = 0; i < maxItems; i++) {
-                        if (i < items.length && items[i] != null) {
-                            Object item = items[i];
+                if (itemsObj instanceof Object[]) {
+                    Object[] items = (Object[]) itemsObj;
+                    for (int i = 0; i < maxItems && i < items.length; i++) {
+                        if (items[i] != null) {
+                            Object itm = items[i];
                             int id = -1;
                             int qty = 0;
                             try {
-                                Method getId = item.getClass().getMethod("getId");
+                                Method getId = itm.getClass().getMethod("getId");
                                 getId.setAccessible(true);
-                                id = (Integer) getId.invoke(item);
+                                id = (Integer) getId.invoke(itm);
                             } catch (Throwable ignored) {}
                             try {
-                                Method getQty = item.getClass().getMethod("getQuantity");
+                                Method getQty = itm.getClass().getMethod("getQuantity");
                                 getQty.setAccessible(true);
-                                qty = (Integer) getQty.invoke(item);
+                                qty = (Integer) getQty.invoke(itm);
                             } catch (Throwable ignored) {}
 
                             if (id > 0 && id != 65535) {
-                                String name = resolveItemName(client, id);
-                                if (name != null && !name.isEmpty() && !name.equalsIgnoreCase("null")) {
-                                    data.append(prefix).append("[").append(i).append("]: ").append(name).append(",").append(qty).append("\n");
-                                } else {
-                                    data.append(prefix).append("[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
-                                }
-                            } else {
-                                data.append(prefix).append("[").append(i).append("]: 0,0\n");
+                                itemIds[i] = id;
+                                itemQtys[i] = Math.max(1, qty);
+                                found = true;
                             }
-                        } else {
-                            data.append(prefix).append("[").append(i).append("]: 0,0\n");
                         }
                     }
-                    return;
+                } else if (itemsObj instanceof Collection) {
+                    int i = 0;
+                    for (Object itm : (Collection<?>) itemsObj) {
+                        if (i >= maxItems) break;
+                        if (itm != null) {
+                            int id = -1;
+                            int qty = 0;
+                            try {
+                                Method getId = itm.getClass().getMethod("getId");
+                                getId.setAccessible(true);
+                                id = (Integer) getId.invoke(itm);
+                            } catch (Throwable ignored) {}
+                            try {
+                                Method getQty = itm.getClass().getMethod("getQuantity");
+                                getQty.setAccessible(true);
+                                qty = (Integer) getQty.invoke(itm);
+                            } catch (Throwable ignored) {}
+
+                            if (id > 0 && id != 65535) {
+                                itemIds[i] = id;
+                                itemQtys[i] = Math.max(1, qty);
+                                found = true;
+                            }
+                        }
+                        i++;
+                    }
                 }
             }
         } catch (Throwable ignored) {}
 
-        // Fallback: output empty slots
+        // Strategy 3: RuneLite Widget fallback
+        if (!found) {
+            try {
+                int[][] targetWidgets = containerId == 93
+                        ? new int[][]{{149, 0}, {9764864, -1}, {15, 3}, {548, 58}, {161, 58}, {164, 58}}
+                        : new int[][]{{387, 0}, {25362432, -1}, {84, 0}, {5505024, -1}};
+
+                for (int[] wSpec : targetWidgets) {
+                    Object widget = null;
+                    if (wSpec[1] >= 0) {
+                        try {
+                            Method getWidget = client.getClass().getMethod("getWidget", int.class, int.class);
+                            getWidget.setAccessible(true);
+                            widget = getWidget.invoke(client, wSpec[0], wSpec[1]);
+                        } catch (Throwable ignored) {}
+                    } else {
+                        try {
+                            Method getWidget = client.getClass().getMethod("getWidget", int.class);
+                            getWidget.setAccessible(true);
+                            widget = getWidget.invoke(client, wSpec[0]);
+                        } catch (Throwable ignored) {}
+                    }
+
+                    if (widget != null) {
+                        // Check dynamic children
+                        Object childrenObj = null;
+                        for (String mName : new String[]{"getChildren", "getDynamicChildren", "getNestedChildren"}) {
+                            try {
+                                Method m = widget.getClass().getMethod(mName);
+                                m.setAccessible(true);
+                                childrenObj = m.invoke(widget);
+                                if (childrenObj != null) break;
+                            } catch (Throwable ignored) {}
+                        }
+
+                        if (childrenObj instanceof Object[]) {
+                            Object[] children = (Object[]) childrenObj;
+                            if (children.length >= maxItems) {
+                                for (int i = 0; i < maxItems && i < children.length; i++) {
+                                    if (children[i] != null) {
+                                        Object ch = children[i];
+                                        int id = -1;
+                                        int qty = 0;
+                                        String name = null;
+                                        try {
+                                            Method getId = ch.getClass().getMethod("getItemId");
+                                            getId.setAccessible(true);
+                                            id = (Integer) getId.invoke(ch);
+                                        } catch (Throwable ignored) {}
+                                        try {
+                                            Method getQty = ch.getClass().getMethod("getItemQuantity");
+                                            getQty.setAccessible(true);
+                                            qty = (Integer) getQty.invoke(ch);
+                                        } catch (Throwable ignored) {}
+                                        try {
+                                            Method getName = ch.getClass().getMethod("getName");
+                                            getName.setAccessible(true);
+                                            Object n = getName.invoke(ch);
+                                            if (n instanceof String) {
+                                                String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                                                if (!s.isEmpty() && !s.equalsIgnoreCase("null")) name = s;
+                                            }
+                                        } catch (Throwable ignored) {}
+
+                                        if (id > 0 && id != 65535) {
+                                            itemIds[i] = id;
+                                            itemQtys[i] = Math.max(1, qty);
+                                            itemNames[i] = name;
+                                            found = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check widget.getItems() & widget.getItemQuantities()
+                        if (!found) {
+                            try {
+                                Method getItems = widget.getClass().getMethod("getItems");
+                                getItems.setAccessible(true);
+                                int[] wItems = (int[]) getItems.invoke(widget);
+                                int[] wQtys = null;
+                                try {
+                                    Method getQtys = widget.getClass().getMethod("getItemQuantities");
+                                    getQtys.setAccessible(true);
+                                    wQtys = (int[]) getQtys.invoke(widget);
+                                } catch (Throwable ignored) {}
+
+                                if (wItems != null && wItems.length >= maxItems) {
+                                    for (int i = 0; i < maxItems && i < wItems.length; i++) {
+                                        int id = wItems[i];
+                                        int qty = (wQtys != null && i < wQtys.length) ? wQtys[i] : 1;
+                                        if (id > 0 && id != 65535) {
+                                            itemIds[i] = id;
+                                            itemQtys[i] = Math.max(1, qty);
+                                            found = true;
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                    if (found) break;
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // Format and append output
         for (int i = 0; i < maxItems; i++) {
-            data.append(prefix).append("[").append(i).append("]: 0,0\n");
+            int id = itemIds[i];
+            int qty = itemQtys[i];
+            if (id > 0 && id != 65535) {
+                String name = itemNames[i];
+                if (name == null) {
+                    name = resolveItemName(client, id);
+                }
+                if (name != null && !name.isEmpty() && !name.equalsIgnoreCase("null")) {
+                    data.append(prefix).append("[").append(i).append("]: ").append(name).append(",").append(qty).append("\n");
+                } else {
+                    data.append(prefix).append("[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
+                }
+            } else {
+                data.append(prefix).append("[").append(i).append("]: 0,0\n");
+            }
         }
     }
 
@@ -1040,28 +1288,140 @@ public class BytecodeAgent {
         String cached = ITEM_NAME_CACHE.get(id);
         if (cached != null) return cached;
 
-        try {
-            for (String mName : new String[]{"getItemDefinition", "getItemComposition"}) {
+        for (String mName : new String[]{"getItemDefinition", "getItemComposition", "createItemComposition", "getRSItemDefinition"}) {
+            try {
+                Method m = null;
                 try {
-                    Method m = client.getClass().getMethod(mName, int.class);
+                    m = client.getClass().getMethod(mName, int.class);
+                } catch (Throwable ignored) {}
+                if (m == null) {
+                    for (Method dm : client.getClass().getMethods()) {
+                        if (dm.getName().equalsIgnoreCase(mName) && dm.getParameterCount() == 1
+                                && (dm.getParameterTypes()[0] == int.class || dm.getParameterTypes()[0] == Integer.class)) {
+                            m = dm;
+                            break;
+                        }
+                    }
+                }
+                if (m != null) {
                     m.setAccessible(true);
                     Object def = m.invoke(client, id);
                     if (def != null) {
-                        Method getName = def.getClass().getMethod("getName");
-                        getName.setAccessible(true);
-                        Object n = getName.invoke(def);
-                        if (n instanceof String) {
-                            String s = ((String) n).replaceAll("<[^>]*>", "").trim();
-                            if (!s.isEmpty() && !s.equalsIgnoreCase("null")) {
-                                ITEM_NAME_CACHE.put(id, s);
-                                return s;
+                        for (String nmMethod : new String[]{"getName", "getMembersName", "getRawName"}) {
+                            try {
+                                Method getName = def.getClass().getMethod(nmMethod);
+                                getName.setAccessible(true);
+                                Object n = getName.invoke(def);
+                                if (n instanceof String) {
+                                    String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                                    if (!s.isEmpty() && !s.equalsIgnoreCase("null")) {
+                                        ITEM_NAME_CACHE.put(id, s);
+                                        return s;
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        for (Field f : def.getClass().getDeclaredFields()) {
+                            if (f.getType() == String.class) {
+                                try {
+                                    f.setAccessible(true);
+                                    Object res = f.get(def);
+                                    if (res instanceof String) {
+                                        String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                                        if (!s.isEmpty() && !s.equalsIgnoreCase("null") && s.length() > 1) {
+                                            ITEM_NAME_CACHE.put(id, s);
+                                            return s;
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
                             }
                         }
                     }
-                } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    private static void appendRuneLitePlayer(Object client, Object player, int index, int playerX, int playerY, Object localPlayer, StringBuilder data) {
+        try {
+            int id = index;
+            int dist = 0;
+            int combatLevel = 0;
+            String name = "Unknown";
+
+            try {
+                Method getId = player.getClass().getMethod("getId");
+                getId.setAccessible(true);
+                id = (Integer) getId.invoke(player);
+            } catch (Throwable ignored) {}
+
+            try {
+                Method getName = player.getClass().getMethod("getName");
+                getName.setAccessible(true);
+                Object res = getName.invoke(player);
+                if (res instanceof String) {
+                    name = ((String) res).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
+                }
+            } catch (Throwable ignored) {}
+
+            if (name.isEmpty() || name.equalsIgnoreCase("null")) {
+                name = "Player " + (index + 1);
+            }
+
+            if (player != null && localPlayer != null && player.equals(localPlayer)) {
+                name = name + " (You)";
+            }
+
+            try {
+                Method getCombatLevel = player.getClass().getMethod("getCombatLevel");
+                getCombatLevel.setAccessible(true);
+                combatLevel = (Integer) getCombatLevel.invoke(player);
+            } catch (Throwable ignored) {}
+
+            try {
+                Method getWorldLocation = player.getClass().getMethod("getWorldLocation");
+                getWorldLocation.setAccessible(true);
+                Object wp = getWorldLocation.invoke(player);
+                if (wp != null && playerX > 0 && playerY > 0) {
+                    Method getX = wp.getClass().getMethod("getX");
+                    Method getY = wp.getClass().getMethod("getY");
+                    getX.setAccessible(true);
+                    getY.setAccessible(true);
+                    int px = (Integer) getX.invoke(wp);
+                    int py = (Integer) getY.invoke(wp);
+                    dist = Math.max(Math.abs(px - playerX), Math.abs(py - playerY));
+                }
+            } catch (Throwable ignored) {}
+
+            data.append("NEARBY_PLAYER[").append(index).append("]: ").append(id).append(",").append(name).append(",").append(dist).append(",").append(combatLevel).append("\n");
+        } catch (Throwable ignored) {}
+    }
+
+    private static String extractPlayerName(Object player) {
+        if (player == null) return "Unknown";
+        try {
+            Method getName = player.getClass().getMethod("getName");
+            getName.setAccessible(true);
+            Object res = getName.invoke(player);
+            if (res instanceof String) {
+                String s = ((String) res).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
+                if (!s.isEmpty() && !s.equalsIgnoreCase("null")) return s;
             }
         } catch (Throwable ignored) {}
-        return null;
+        for (Field f : player.getClass().getDeclaredFields()) {
+            if (f.getType() == String.class) {
+                try {
+                    f.setAccessible(true);
+                    Object res = f.get(player);
+                    if (res instanceof String) {
+                        String s = ((String) res).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
+                        if (!s.isEmpty() && !s.equalsIgnoreCase("null") && s.length() > 1) return s;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        return "Player";
     }
 
     private static void appendRuneLiteNpc(Object client, Object npc, int index, int playerX, int playerY, StringBuilder data) {
@@ -1421,6 +1781,24 @@ public class BytecodeAgent {
                         }
                     }
                     data.append("TOTAL_NPCS: ").append(count).append("\n");
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Players
+        if (playerListField != null) {
+            try {
+                Object[] players = (Object[]) playerListField.get(null);
+                if (players != null) {
+                    int count = 0;
+                    for (Object p : players) {
+                        if (p != null && count < 25) {
+                            String name = extractPlayerName(p);
+                            data.append("NEARBY_PLAYER[").append(count).append("]: ").append(count).append(",").append(name).append(",0,126\n");
+                            count++;
+                        }
+                    }
+                    data.append("TOTAL_PLAYERS: ").append(count).append("\n");
                 }
             } catch (Exception ignored) {}
         }
