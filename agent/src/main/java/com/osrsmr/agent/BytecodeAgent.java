@@ -191,7 +191,7 @@ public class BytecodeAgent {
     }
 
     private static void scanAndDiscover(Instrumentation inst) {
-        if (runeLiteClient != null || inst == null) {
+        if ((runeLiteClient != null && runeLiteItemManager != null) || inst == null) {
             return;
         }
         try {
@@ -1349,7 +1349,7 @@ public class BytecodeAgent {
                     m.setAccessible(true);
                     Object comp = m.invoke(runeLiteItemManager, id);
                     if (comp != null) {
-                        String name = extractNameFromItemComposition(comp);
+                        String name = extractNameFromItemComposition(client, comp, id);
                         if (name != null) {
                             ITEM_NAME_CACHE.put(id, name);
                             return name;
@@ -1370,7 +1370,7 @@ public class BytecodeAgent {
                             m.setAccessible(true);
                             Object comp = m.invoke(targetClient, id);
                             if (comp != null) {
-                                String name = extractNameFromItemComposition(comp);
+                                String name = extractNameFromItemComposition(client, comp, id);
                                 if (name != null) {
                                     ITEM_NAME_CACHE.put(id, name);
                                     return name;
@@ -1393,8 +1393,10 @@ public class BytecodeAgent {
         return null;
     }
 
-    private static String extractNameFromItemComposition(Object comp) {
+    private static String extractNameFromItemComposition(Object client, Object comp, int originalId) {
         if (comp == null) return null;
+
+        // Try direct name methods
         for (String nmMethod : new String[]{"getName", "getMembersName", "getRawName"}) {
             try {
                 Method getName = comp.getClass().getMethod(nmMethod);
@@ -1408,19 +1410,80 @@ public class BytecodeAgent {
                 }
             } catch (Throwable ignored) {}
         }
-        for (Field f : comp.getClass().getDeclaredFields()) {
-            if (f.getType() == String.class) {
-                try {
-                    f.setAccessible(true);
-                    Object res = f.get(comp);
-                    if (res instanceof String) {
-                        String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                        if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none") && s.length() > 1) {
-                            return s;
+
+        // Try any zero-parameter String-returning method with 'name'
+        for (Method m : comp.getClass().getMethods()) {
+            if (m.getParameterCount() == 0 && m.getReturnType() == String.class) {
+                String mName = m.getName().toLowerCase();
+                if (mName.contains("name")) {
+                    try {
+                        m.setAccessible(true);
+                        Object n = m.invoke(comp);
+                        if (n instanceof String) {
+                            String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                            if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none")) {
+                                return s;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        }
+
+        // Check if this is a noted item and resolve linked unnoted item
+        for (String mName : new String[]{"getLinkedNoteId", "getNote", "getUnnotedId"}) {
+            try {
+                Method m = comp.getClass().getMethod(mName);
+                m.setAccessible(true);
+                Object res = m.invoke(comp);
+                if (res instanceof Integer) {
+                    int linkedId = (Integer) res;
+                    if (linkedId > 0 && linkedId != originalId) {
+                        String unnotedName = resolveItemName(client, linkedId);
+                        if (unnotedName != null && !unnotedName.isEmpty()) {
+                            return unnotedName;
                         }
                     }
-                } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // Check if placeholder and resolve base item
+        for (String mName : new String[]{"getPlaceholderId", "getPlaceholderTemplateId"}) {
+            try {
+                Method m = comp.getClass().getMethod(mName);
+                m.setAccessible(true);
+                Object res = m.invoke(comp);
+                if (res instanceof Integer) {
+                    int placeholderId = (Integer) res;
+                    if (placeholderId > 0 && placeholderId != originalId) {
+                        String baseName = resolveItemName(client, placeholderId);
+                        if (baseName != null && !baseName.isEmpty()) {
+                            return baseName;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // Search all fields in inheritance hierarchy
+        Class<?> curr = comp.getClass();
+        while (curr != null && curr != Object.class) {
+            for (Field f : curr.getDeclaredFields()) {
+                if (f.getType() == String.class) {
+                    try {
+                        f.setAccessible(true);
+                        Object res = f.get(comp);
+                        if (res instanceof String) {
+                            String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                            if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none") && s.length() > 1) {
+                                return s;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
             }
+            curr = curr.getSuperclass();
         }
         return null;
     }
@@ -1637,6 +1700,74 @@ public class BytecodeAgent {
             case 8010: return "Camelot teleport";
             case 8011: return "Ardougne teleport";
             case 8013: return "Teleport to house";
+            case 2412: return "Saradomin cape";
+            case 2413: return "Guthix cape";
+            case 2414: return "Zamorak cape";
+            case 21791: return "Imbued saradomin cape";
+            case 21793: return "Imbued guthix cape";
+            case 21795: return "Imbued zamorak cape";
+            case 11850: return "Graceful hood";
+            case 11852: return "Graceful cape";
+            case 11854: return "Graceful top";
+            case 11856: return "Graceful legs";
+            case 11858: return "Graceful gloves";
+            case 11860: return "Graceful boots";
+            case 8839: return "Void knight top";
+            case 8840: return "Void knight robe";
+            case 8842: return "Void knight gloves";
+            case 11663: return "Void mage helm";
+            case 11664: return "Void ranger helm";
+            case 11665: return "Void melee helm";
+            case 13072: return "Elite void top";
+            case 13073: return "Elite void robe";
+            case 12791: return "Rune pouch";
+            case 27281: return "Divine rune pouch";
+            case 12940: return "Toxic staff of the dead";
+            case 12904: return "Toxic staff (uncharged)";
+            case 12929: return "Serpentine helm (uncharged)";
+            case 12931: return "Serpentine helm";
+            case 13239: return "Primordial boots";
+            case 13237: return "Pegasian boots";
+            case 13235: return "Eternal boots";
+            case 22978: return "Brimstone ring";
+            case 20653: return "Amulet of the damned";
+            case 20655: return "Amulet of the damned (full)";
+            case 2452: return "Antifire potion(4)";
+            case 2454: return "Antifire potion(3)";
+            case 2456: return "Antifire potion(2)";
+            case 2458: return "Antifire potion(1)";
+            case 11951: return "Extended antifire(4)";
+            case 11953: return "Extended antifire(3)";
+            case 11955: return "Extended antifire(2)";
+            case 11957: return "Extended antifire(1)";
+            case 22209: return "Extended super antifire(4)";
+            case 22212: return "Extended super antifire(3)";
+            case 22215: return "Extended super antifire(2)";
+            case 22218: return "Extended super antifire(1)";
+            case 2446: return "Antipoison(4)";
+            case 175: return "Antipoison(3)";
+            case 177: return "Antipoison(2)";
+            case 179: return "Antipoison(1)";
+            case 2448: return "Superantipoison(4)";
+            case 181: return "Superantipoison(3)";
+            case 183: return "Superantipoison(2)";
+            case 185: return "Superantipoison(1)";
+            case 5952: return "Antidote+(4)";
+            case 5954: return "Antidote+(3)";
+            case 5956: return "Antidote+(2)";
+            case 5958: return "Antidote+(1)";
+            case 5943: return "Antidote++(4)";
+            case 5945: return "Antidote++(3)";
+            case 5947: return "Antidote++(2)";
+            case 5949: return "Antidote++(1)";
+            case 12913: return "Anti-venom(4)";
+            case 12915: return "Anti-venom(3)";
+            case 12917: return "Anti-venom(2)";
+            case 12919: return "Anti-venom(1)";
+            case 12905: return "Anti-venom+(4)";
+            case 12907: return "Anti-venom+(3)";
+            case 12909: return "Anti-venom+(2)";
+            case 12911: return "Anti-venom+(1)";
             default: return null;
         }
     }

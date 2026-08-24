@@ -476,7 +476,7 @@ public partial class MainWindow : Window
                 string slotId = key.Substring(openBracket + 1, closeBracket - openBracket - 1);
                 if (_equipmentSlots.TryGetValue(slotId, out var border))
                 {
-                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "0,0" || value.StartsWith("0,"))
+                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "65535" || value == "0,0" || value.StartsWith("0,") || value.StartsWith("-1,") || value.StartsWith("65535,"))
                     {
                         border.Background = new SolidColorBrush(Color.FromRgb(42, 42, 42));
                         border.ToolTip = null;
@@ -528,7 +528,7 @@ public partial class MainWindow : Window
                 int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
                 if (index >= 0 && index < 28)
                 {
-                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "0,0" || value.StartsWith("0,"))
+                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "65535" || value == "0,0" || value.StartsWith("0,") || value.StartsWith("-1,") || value.StartsWith("65535,"))
                     {
                         _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128));
                         _inventorySlots[index].ToolTip = $"Slot {index + 1}: Empty";
@@ -1545,6 +1545,124 @@ public static class ItemDatabase
         _items[8010] = "Camelot teleport";
         _items[8011] = "Ardougne teleport";
         _items[8013] = "Teleport to house";
+        _items[2412] = "Saradomin cape";
+        _items[2413] = "Guthix cape";
+        _items[2414] = "Zamorak cape";
+        _items[21791] = "Imbued saradomin cape";
+        _items[21793] = "Imbued guthix cape";
+        _items[21795] = "Imbued zamorak cape";
+        _items[11850] = "Graceful hood";
+        _items[11852] = "Graceful cape";
+        _items[11854] = "Graceful top";
+        _items[11856] = "Graceful legs";
+        _items[11858] = "Graceful gloves";
+        _items[11860] = "Graceful boots";
+        _items[8839] = "Void knight top";
+        _items[8840] = "Void knight robe";
+        _items[8842] = "Void knight gloves";
+        _items[11663] = "Void mage helm";
+        _items[11664] = "Void ranger helm";
+        _items[11665] = "Void melee helm";
+        _items[13072] = "Elite void top";
+        _items[13073] = "Elite void robe";
+        _items[12791] = "Rune pouch";
+        _items[27281] = "Divine rune pouch";
+        _items[12940] = "Toxic staff of the dead";
+        _items[12904] = "Toxic staff (uncharged)";
+        _items[12926] = "Toxic blowpipe";
+        _items[12924] = "Toxic blowpipe (empty)";
+        _items[12929] = "Serpentine helm (uncharged)";
+        _items[12931] = "Serpentine helm";
+        _items[13239] = "Primordial boots";
+        _items[13237] = "Pegasian boots";
+        _items[13235] = "Eternal boots";
+        _items[22978] = "Brimstone ring";
+        _items[19553] = "Amulet of torture";
+        _items[19547] = "Necklace of anguish";
+        _items[19544] = "Tormented bracelet";
+        _items[19550] = "Ring of suffering";
+        _items[20653] = "Amulet of the damned";
+        _items[20655] = "Amulet of the damned (full)";
+        _items[11770] = "Seers ring (i)";
+        _items[11771] = "Archers ring (i)";
+        _items[11772] = "Warrior ring (i)";
+        _items[11773] = "Berserker ring (i)";
+        _items[12695] = "Super combat potion(4)";
+        _items[12697] = "Super combat potion(3)";
+        _items[12699] = "Super combat potion(2)";
+        _items[12701] = "Super combat potion(1)";
+        _items[23685] = "Divine super combat potion(4)";
+        _items[23688] = "Divine super combat potion(3)";
+        _items[23691] = "Divine super combat potion(2)";
+        _items[23694] = "Divine super combat potion(1)";
+        _items[2452] = "Antifire potion(4)";
+        _items[2454] = "Antifire potion(3)";
+        _items[2456] = "Antifire potion(2)";
+        _items[2458] = "Antifire potion(1)";
+        _items[11951] = "Extended antifire(4)";
+        _items[11953] = "Extended antifire(3)";
+        _items[11955] = "Extended antifire(2)";
+        _items[11957] = "Extended antifire(1)";
+        _items[22209] = "Extended super antifire(4)";
+        _items[22212] = "Extended super antifire(3)";
+        _items[22215] = "Extended super antifire(2)";
+        _items[22218] = "Extended super antifire(1)";
+        _items[2446] = "Antipoison(4)";
+        _items[175] = "Antipoison(3)";
+        _items[177] = "Antipoison(2)";
+        _items[179] = "Antipoison(1)";
+        _items[2448] = "Superantipoison(4)";
+        _items[181] = "Superantipoison(3)";
+        _items[183] = "Superantipoison(2)";
+        _items[185] = "Superantipoison(1)";
+        _items[5952] = "Antidote+(4)";
+        _items[5954] = "Antidote+(3)";
+        _items[5956] = "Antidote+(2)";
+        _items[5958] = "Antidote+(1)";
+        _items[5943] = "Antidote++(4)";
+        _items[5945] = "Antidote++(3)";
+        _items[5947] = "Antidote++(2)";
+        _items[5949] = "Antidote++(1)";
+        _items[12913] = "Anti-venom(4)";
+        _items[12915] = "Anti-venom(3)";
+        _items[12917] = "Anti-venom(2)";
+        _items[12919] = "Anti-venom(1)";
+        _items[12905] = "Anti-venom+(4)";
+        _items[12907] = "Anti-venom+(3)";
+        _items[12909] = "Anti-venom+(2)";
+        _items[12911] = "Anti-venom+(1)";
+        _items[3024] = "Super restore(4)";
+        _items[3026] = "Super restore(3)";
+        _items[3028] = "Super restore(2)";
+        _items[3030] = "Super restore(1)";
+        _items[6685] = "Saradomin brew(4)";
+        _items[6687] = "Saradomin brew(3)";
+        _items[6689] = "Saradomin brew(2)";
+        _items[6691] = "Saradomin brew(1)";
+        _items[12625] = "Stamina potion(4)";
+        _items[12627] = "Stamina potion(3)";
+        _items[12629] = "Stamina potion(2)";
+        _items[12631] = "Stamina potion(1)";
+        _items[2436] = "Super attack(4)";
+        _items[145] = "Super attack(3)";
+        _items[147] = "Super attack(2)";
+        _items[149] = "Super attack(1)";
+        _items[2440] = "Super strength(4)";
+        _items[157] = "Super strength(3)";
+        _items[159] = "Super strength(2)";
+        _items[161] = "Super strength(1)";
+        _items[2442] = "Super defence(4)";
+        _items[163] = "Super defence(3)";
+        _items[165] = "Super defence(2)";
+        _items[167] = "Super defence(1)";
+        _items[2444] = "Ranging potion(4)";
+        _items[169] = "Ranging potion(3)";
+        _items[171] = "Ranging potion(2)";
+        _items[173] = "Ranging potion(1)";
+        _items[3040] = "Magic potion(4)";
+        _items[3042] = "Magic potion(3)";
+        _items[3044] = "Magic potion(2)";
+        _items[3046] = "Magic potion(1)";
     }
 
     private static async Task InitializeOnlineMappingAsync()
@@ -1567,16 +1685,33 @@ public static class ItemDatabase
 
             _httpClient.DefaultRequestHeaders.UserAgent.Clear();
             _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("osrsmr - osrs item mapping helper");
-            string json = await _httpClient.GetStringAsync("https://prices.runescape.wiki/api/v1/osrs/mapping");
-            if (!string.IsNullOrWhiteSpace(json))
+
+            // 1. Fetch complete item database (all tradeable & untradeable items)
+            try
             {
-                LoadFromJson(json);
-                try
+                string jsonDb = await _httpClient.GetStringAsync("https://raw.githubusercontent.com/osrsbox/osrsbox-db/master/docs/items-summary.json");
+                if (!string.IsNullOrWhiteSpace(jsonDb))
                 {
-                    await File.WriteAllTextAsync(cacheFile, json);
+                    LoadFromJson(jsonDb);
+                    try
+                    {
+                        await File.WriteAllTextAsync(cacheFile, jsonDb);
+                    }
+                    catch { }
                 }
-                catch { }
             }
+            catch { }
+
+            // 2. Fetch OSRS wiki mapping
+            try
+            {
+                string jsonWiki = await _httpClient.GetStringAsync("https://prices.runescape.wiki/api/v1/osrs/mapping");
+                if (!string.IsNullOrWhiteSpace(jsonWiki))
+                {
+                    LoadFromJson(jsonWiki);
+                }
+            }
+            catch { }
         }
         catch { }
     }
@@ -1586,7 +1721,44 @@ public static class ItemDatabase
         try
         {
             using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (int.TryParse(prop.Name, out int propId) && propId > 0)
+                    {
+                        if (prop.Value.ValueKind == JsonValueKind.Object)
+                        {
+                            if (prop.Value.TryGetProperty("name", out var nameProp))
+                            {
+                                string? name = nameProp.GetString();
+                                if (!string.IsNullOrWhiteSpace(name))
+                                {
+                                    _items[propId] = name;
+                                }
+                            }
+                        }
+                        else if (prop.Value.ValueKind == JsonValueKind.String)
+                        {
+                            string? name = prop.Value.GetString();
+                            if (!string.IsNullOrWhiteSpace(name))
+                            {
+                                _items[propId] = name;
+                            }
+                        }
+                    }
+                    else if (prop.Value.ValueKind == JsonValueKind.Object && prop.Value.TryGetProperty("id", out var idProp) && prop.Value.TryGetProperty("name", out var nameProp))
+                    {
+                        int id = idProp.GetInt32();
+                        string? name = nameProp.GetString();
+                        if (id > 0 && !string.IsNullOrWhiteSpace(name))
+                        {
+                            _items[id] = name;
+                        }
+                    }
+                }
+            }
+            else if (doc.RootElement.ValueKind == JsonValueKind.Array)
             {
                 foreach (var el in doc.RootElement.EnumerateArray())
                 {
