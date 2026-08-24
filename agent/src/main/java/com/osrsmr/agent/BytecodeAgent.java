@@ -32,6 +32,8 @@ public class BytecodeAgent {
     
     // RuneLite API / Instance Cache
     private static Object runeLiteClient = null;
+    private static Object runeLiteInjector = null;
+    private static Object runeLiteItemManager = null;
     
     // Obfuscated Field Discovery State
     private static String foundClientClass = null;
@@ -222,6 +224,41 @@ public class BytecodeAgent {
                             }
 
                             if (injector != null) {
+                                runeLiteInjector = injector;
+
+                                // Acquire ItemManager from Injector
+                                if (runeLiteItemManager == null) {
+                                    try {
+                                        Class<?> itemMgrClass = null;
+                                        try {
+                                            itemMgrClass = Class.forName("net.runelite.client.game.ItemManager", false, clazz.getClassLoader());
+                                        } catch (Throwable ignored) {}
+                                        if (itemMgrClass == null) {
+                                            for (Class<?> c : allLoaded) {
+                                                if (c.getName().equals("net.runelite.client.game.ItemManager")) {
+                                                    itemMgrClass = c;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (itemMgrClass != null) {
+                                            for (Method m : injector.getClass().getMethods()) {
+                                                if (m.getName().equals("getInstance") && m.getParameterCount() == 1 && m.getParameterTypes()[0] == Class.class) {
+                                                    try {
+                                                        m.setAccessible(true);
+                                                        Object mgr = m.invoke(injector, itemMgrClass);
+                                                        if (mgr != null) {
+                                                            runeLiteItemManager = mgr;
+                                                            System.out.println("[osrsmr] RuneLite ItemManager acquired via Injector.getInstance(ItemManager.class)");
+                                                            break;
+                                                        }
+                                                    } catch (Throwable ignored) {}
+                                                }
+                                            }
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+
                                 Class<?> clientClass = null;
                                 try {
                                     clientClass = Class.forName("net.runelite.api.Client", false, clazz.getClassLoader());
@@ -252,7 +289,7 @@ public class BytecodeAgent {
                                     }
                                 }
 
-                                if (runeLiteClient == null) {
+                                if (runeLiteClient == null || runeLiteItemManager == null) {
                                     try {
                                         Method getAllBindings = injector.getClass().getMethod("getAllBindings");
                                         getAllBindings.setAccessible(true);
@@ -260,7 +297,7 @@ public class BytecodeAgent {
                                         if (map != null) {
                                             for (Map.Entry<?, ?> entry : map.entrySet()) {
                                                 String keyStr = String.valueOf(entry.getKey());
-                                                if (keyStr.contains("net.runelite.api.Client") || keyStr.contains("RSClient")) {
+                                                if (runeLiteClient == null && (keyStr.contains("net.runelite.api.Client") || keyStr.contains("RSClient"))) {
                                                     try {
                                                         Object binding = entry.getValue();
                                                         Method getProvider = binding.getClass().getMethod("getProvider");
@@ -273,7 +310,23 @@ public class BytecodeAgent {
                                                             if (val != null && isRuneLiteClientObject(val)) {
                                                                 runeLiteClient = val;
                                                                 System.out.println("[osrsmr] RuneLite Client acquired via Injector binding " + keyStr);
-                                                                break;
+                                                            }
+                                                        }
+                                                    } catch (Throwable ignored) {}
+                                                }
+                                                if (runeLiteItemManager == null && keyStr.contains("ItemManager")) {
+                                                    try {
+                                                        Object binding = entry.getValue();
+                                                        Method getProvider = binding.getClass().getMethod("getProvider");
+                                                        getProvider.setAccessible(true);
+                                                        Object provider = getProvider.invoke(binding);
+                                                        if (provider != null) {
+                                                            Method get = provider.getClass().getMethod("get");
+                                                            get.setAccessible(true);
+                                                            Object val = get.invoke(provider);
+                                                            if (val != null) {
+                                                                runeLiteItemManager = val;
+                                                                System.out.println("[osrsmr] RuneLite ItemManager acquired via Injector binding " + keyStr);
                                                             }
                                                         }
                                                     } catch (Throwable ignored) {}
@@ -1284,63 +1337,308 @@ public class BytecodeAgent {
     }
 
     private static String resolveItemName(Object client, int id) {
-        if (id <= 0 || client == null) return null;
+        if (id <= 0) return null;
         String cached = ITEM_NAME_CACHE.get(id);
         if (cached != null) return cached;
 
-        for (String mName : new String[]{"getItemDefinition", "getItemComposition", "createItemComposition", "getRSItemDefinition"}) {
-            try {
-                Method m = null;
+        // 1. Try RuneLite ItemManager
+        if (runeLiteItemManager != null) {
+            for (String mName : new String[]{"getItemComposition", "getItemDefinition"}) {
                 try {
-                    m = client.getClass().getMethod(mName, int.class);
+                    Method m = runeLiteItemManager.getClass().getMethod(mName, int.class);
+                    m.setAccessible(true);
+                    Object comp = m.invoke(runeLiteItemManager, id);
+                    if (comp != null) {
+                        String name = extractNameFromItemComposition(comp);
+                        if (name != null) {
+                            ITEM_NAME_CACHE.put(id, name);
+                            return name;
+                        }
+                    }
                 } catch (Throwable ignored) {}
-                if (m == null) {
-                    for (Method dm : client.getClass().getMethods()) {
-                        if (dm.getName().equalsIgnoreCase(mName) && dm.getParameterCount() == 1
-                                && (dm.getParameterTypes()[0] == int.class || dm.getParameterTypes()[0] == Integer.class)) {
-                            m = dm;
+            }
+        }
+
+        // 2. Try RuneLite Client / RSClient instance
+        Object targetClient = client != null ? client : runeLiteClient;
+        if (targetClient != null) {
+            for (String mName : new String[]{"getItemComposition", "getItemDefinition", "getRSItemDefinition", "createItemComposition"}) {
+                try {
+                    for (Method m : targetClient.getClass().getMethods()) {
+                        if (m.getName().equalsIgnoreCase(mName) && m.getParameterCount() == 1
+                                && (m.getParameterTypes()[0] == int.class || m.getParameterTypes()[0] == Integer.class)) {
+                            m.setAccessible(true);
+                            Object comp = m.invoke(targetClient, id);
+                            if (comp != null) {
+                                String name = extractNameFromItemComposition(comp);
+                                if (name != null) {
+                                    ITEM_NAME_CACHE.put(id, name);
+                                    return name;
+                                }
+                            }
                             break;
                         }
                     }
-                }
-                if (m != null) {
-                    m.setAccessible(true);
-                    Object def = m.invoke(client, id);
-                    if (def != null) {
-                        for (String nmMethod : new String[]{"getName", "getMembersName", "getRawName"}) {
-                            try {
-                                Method getName = def.getClass().getMethod(nmMethod);
-                                getName.setAccessible(true);
-                                Object n = getName.invoke(def);
-                                if (n instanceof String) {
-                                    String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                                    if (!s.isEmpty() && !s.equalsIgnoreCase("null")) {
-                                        ITEM_NAME_CACHE.put(id, s);
-                                        return s;
-                                    }
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                        for (Field f : def.getClass().getDeclaredFields()) {
-                            if (f.getType() == String.class) {
-                                try {
-                                    f.setAccessible(true);
-                                    Object res = f.get(def);
-                                    if (res instanceof String) {
-                                        String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                                        if (!s.isEmpty() && !s.equalsIgnoreCase("null") && s.length() > 1) {
-                                            ITEM_NAME_CACHE.put(id, s);
-                                            return s;
-                                        }
-                                    }
-                                } catch (Throwable ignored) {}
-                            }
-                        }
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        // 3. Built-in item lookup dictionary
+        String builtin = getBuiltinItemName(id);
+        if (builtin != null) {
+            ITEM_NAME_CACHE.put(id, builtin);
+            return builtin;
+        }
+
+        return null;
+    }
+
+    private static String extractNameFromItemComposition(Object comp) {
+        if (comp == null) return null;
+        for (String nmMethod : new String[]{"getName", "getMembersName", "getRawName"}) {
+            try {
+                Method getName = comp.getClass().getMethod(nmMethod);
+                getName.setAccessible(true);
+                Object n = getName.invoke(comp);
+                if (n instanceof String) {
+                    String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                    if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none")) {
+                        return s;
                     }
                 }
             } catch (Throwable ignored) {}
         }
+        for (Field f : comp.getClass().getDeclaredFields()) {
+            if (f.getType() == String.class) {
+                try {
+                    f.setAccessible(true);
+                    Object res = f.get(comp);
+                    if (res instanceof String) {
+                        String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+                        if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none") && s.length() > 1) {
+                            return s;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
         return null;
+    }
+
+    private static String getBuiltinItemName(int id) {
+        switch (id) {
+            case 995: return "Coins";
+            case 1351: return "Bronze axe";
+            case 1349: return "Iron axe";
+            case 1353: return "Steel axe";
+            case 1355: return "Mithril axe";
+            case 1357: return "Adamant axe";
+            case 1359: return "Rune axe";
+            case 6739: return "Dragon axe";
+            case 1265: return "Bronze pickaxe";
+            case 1267: return "Iron pickaxe";
+            case 1269: return "Steel pickaxe";
+            case 1273: return "Mithril pickaxe";
+            case 1271: return "Adamant pickaxe";
+            case 1275: return "Rune pickaxe";
+            case 11920: return "Dragon pickaxe";
+            case 303: return "Small fishing net";
+            case 307: return "Fishing rod";
+            case 309: return "Fly fishing rod";
+            case 311: return "Harpoon";
+            case 301: return "Lobster pot";
+            case 313: return "Fishing bait";
+            case 314: return "Feather";
+            case 590: return "Tinderbox";
+            case 1755: return "Chisel";
+            case 2347: return "Hammer";
+            case 1733: return "Needle";
+            case 1734: return "Thread";
+            case 946: return "Knife";
+            case 1925: return "Bucket";
+            case 1929: return "Bucket of water";
+            case 1935: return "Jug";
+            case 1937: return "Jug of water";
+            case 227: return "Vial of water";
+            case 229: return "Vial";
+            case 554: return "Fire rune";
+            case 555: return "Water rune";
+            case 556: return "Air rune";
+            case 557: return "Earth rune";
+            case 558: return "Mind rune";
+            case 559: return "Body rune";
+            case 560: return "Death rune";
+            case 561: return "Nature rune";
+            case 562: return "Chaos rune";
+            case 563: return "Law rune";
+            case 564: return "Cosmic rune";
+            case 565: return "Blood rune";
+            case 566: return "Soul rune";
+            case 21880: return "Wrath rune";
+            case 9075: return "Astral rune";
+            case 315: return "Shrimps";
+            case 325: return "Salmon";
+            case 329: return "Salmon";
+            case 333: return "Trout";
+            case 377: return "Lobster";
+            case 379: return "Lobster";
+            case 383: return "Raw shark";
+            case 385: return "Shark";
+            case 386: return "Shark (noted)";
+            case 395: case 397: return "Sea turtle";
+            case 389: case 391: return "Manta ray";
+            case 3144: return "Cooked karambwan";
+            case 13441: return "Anglerfish";
+            case 11936: return "Dark crab";
+            case 7946: return "Monkfish";
+            case 2434: case 139: case 141: case 143: return "Prayer potion";
+            case 6685: case 6687: case 6689: case 6691: return "Saradomin brew";
+            case 3024: case 3026: case 3028: case 3030: return "Super restore";
+            case 12625: case 12627: case 12629: case 12631: return "Stamina potion";
+            case 2440: case 157: case 159: case 161: return "Super strength";
+            case 2436: case 145: case 147: case 149: return "Super attack";
+            case 2442: case 163: case 165: case 167: return "Super defence";
+            case 2444: case 169: case 171: case 173: return "Ranging potion";
+            case 3040: case 3042: case 3044: case 3046: return "Magic potion";
+            case 12695: case 12697: case 12699: case 12701: return "Super combat potion";
+            case 23685: case 23688: case 23691: case 23694: return "Divine super combat potion";
+            case 4151: return "Abyssal whip";
+            case 12006: return "Abyssal tentacle";
+            case 1305: return "Dragon longsword";
+            case 4587: return "Dragon scimitar";
+            case 1377: return "Dragon battleaxe";
+            case 1215: case 5698: return "Dragon dagger";
+            case 11802: return "Armadyl godsword";
+            case 11804: return "Bandos godsword";
+            case 11806: return "Saradomin godsword";
+            case 11808: return "Zamorak godsword";
+            case 11832: return "Bandos chestplate";
+            case 11834: return "Bandos tassets";
+            case 11836: return "Bandos boots";
+            case 11826: return "Armadyl helmet";
+            case 11828: return "Armadyl chestplate";
+            case 11830: return "Armadyl chainskirt";
+            case 11840: return "Dragon boots";
+            case 21736: return "Primordial boots";
+            case 21742: return "Pegasian boots";
+            case 21748: return "Eternal boots";
+            case 6585: return "Amulet of fury";
+            case 19553: return "Amulet of torture";
+            case 19547: return "Necklace of anguish";
+            case 19544: return "Tormented bracelet";
+            case 19550: return "Ring of suffering";
+            case 1704: case 1712: case 11978: return "Amulet of glory";
+            case 1725: return "Amulet of strength";
+            case 1727: return "Amulet of magic";
+            case 1731: return "Amulet of power";
+            case 6737: case 11773: return "Berserker ring";
+            case 6731: case 11770: return "Seers ring";
+            case 6733: case 11771: return "Archers ring";
+            case 6735: case 11772: return "Warrior ring";
+            case 22975: return "Brimstone ring";
+            case 7462: return "Barrows gloves";
+            case 7461: return "Dragon gloves";
+            case 7460: return "Rune gloves";
+            case 10551: return "Fighter torso";
+            case 1127: return "Rune platebody";
+            case 1079: return "Rune platelegs";
+            case 1093: return "Rune plateskirt";
+            case 1163: return "Rune full helm";
+            case 1201: return "Rune kiteshield";
+            case 3140: return "Dragon chainbody";
+            case 4087: return "Dragon platelegs";
+            case 4585: return "Dragon plateskirt";
+            case 1149: return "Dragon med helm";
+            case 11838: case 12954: return "Dragon defender";
+            case 8850: return "Rune defender";
+            case 12926: case 12924: return "Toxic blowpipe";
+            case 12934: return "Zulrah's scales";
+            case 11283: return "Dragonfire shield";
+            case 10499: return "Ava's accumulator";
+            case 22109: return "Ava's assembler";
+            case 25865: case 25867: return "Bow of faerdhinen";
+            case 20997: return "Twisted bow";
+            case 22325: return "Scythe of vitur";
+            case 27275: return "Tumeken's shadow";
+            case 4716: return "Dharok's helm";
+            case 4718: return "Dharok's greataxe";
+            case 4720: return "Dharok's platebody";
+            case 4722: return "Dharok's platelegs";
+            case 4708: return "Ahrim's hood";
+            case 4710: return "Ahrim's staff";
+            case 4712: return "Ahrim's robetop";
+            case 4714: return "Ahrim's robeskirt";
+            case 4724: return "Guthan's helm";
+            case 4726: return "Guthan's warspear";
+            case 4728: return "Guthan's platebody";
+            case 4730: return "Guthan's chainskirt";
+            case 4732: return "Karil's coif";
+            case 4734: return "Karil's crossbow";
+            case 4736: return "Karil's leathertop";
+            case 4738: return "Karil's leatherskirt";
+            case 4745: return "Torag's helm";
+            case 4747: return "Torag's hammers";
+            case 4749: return "Torag's platebody";
+            case 4751: return "Torag's platelegs";
+            case 4753: return "Verac's helm";
+            case 4755: return "Verac's flail";
+            case 4757: return "Verac's brassard";
+            case 4759: return "Verac's plateskirt";
+            case 11864: case 11865: return "Slayer helmet";
+            case 6570: return "Fire cape";
+            case 21295: return "Infernal cape";
+            case 13280: return "Max cape";
+            case 436: return "Copper ore";
+            case 438: return "Tin ore";
+            case 440: return "Iron ore";
+            case 442: return "Silver ore";
+            case 444: return "Gold ore";
+            case 447: return "Mithril ore";
+            case 449: return "Adamantite ore";
+            case 451: return "Runite ore";
+            case 453: return "Coal";
+            case 2349: return "Bronze bar";
+            case 2351: return "Iron bar";
+            case 2353: return "Steel bar";
+            case 2355: return "Silver bar";
+            case 2357: return "Gold bar";
+            case 2359: return "Mithril bar";
+            case 2361: return "Adamantite bar";
+            case 2363: return "Runite bar";
+            case 1511: return "Logs";
+            case 1521: return "Oak logs";
+            case 1519: return "Willow logs";
+            case 6333: return "Teak logs";
+            case 1517: return "Maple logs";
+            case 6332: return "Mahogany logs";
+            case 1515: return "Yew logs";
+            case 1513: return "Magic logs";
+            case 19669: return "Redwood logs";
+            case 526: return "Bones";
+            case 532: return "Big bones";
+            case 536: return "Dragon bones";
+            case 22124: return "Superior dragon bones";
+            case 199: return "Grimy guam leaf";
+            case 201: return "Grimy marrentill";
+            case 203: return "Grimy tarromin";
+            case 205: return "Grimy harralander";
+            case 207: return "Grimy ranarr weed";
+            case 209: return "Grimy irit leaf";
+            case 211: return "Grimy avantoe";
+            case 213: return "Grimy kwuarm";
+            case 215: return "Grimy cadantine";
+            case 217: return "Grimy dwarf weed";
+            case 219: return "Grimy torstol";
+            case 3049: return "Grimy toadflax";
+            case 3051: return "Grimy snapdragon";
+            case 8007: return "Varrock teleport";
+            case 8008: return "Lumbridge teleport";
+            case 8009: return "Falador teleport";
+            case 8010: return "Camelot teleport";
+            case 8011: return "Ardougne teleport";
+            case 8013: return "Teleport to house";
+            default: return null;
+        }
     }
 
     private static void appendRuneLitePlayer(Object client, Object player, int index, int playerX, int playerY, Object localPlayer, StringBuilder data) {
@@ -1745,7 +2043,12 @@ public class BytecodeAgent {
                                 if (decoded >= 0 && decoded < 2147483647) { qty = decoded; break; }
                             }
                         }
-                        data.append("INV[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
+                        String name = resolveItemName(null, id);
+                        if (name != null && !name.isEmpty()) {
+                            data.append("INV[").append(i).append("]: ").append(name).append(",").append(qty).append("\n");
+                        } else {
+                            data.append("INV[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
+                        }
                     }
                 }
             } catch (Exception ignored) {}
@@ -1758,7 +2061,12 @@ public class BytecodeAgent {
                 if (equipment != null) {
                     for (int i = 0; i < equipment.length; i++) {
                         if (equipment[i] > 0) {
-                            data.append("EQUIP[").append(i).append("]: ").append(equipment[i]).append(",1\n");
+                            String name = resolveItemName(null, equipment[i]);
+                            if (name != null && !name.isEmpty()) {
+                                data.append("EQUIP[").append(i).append("]: ").append(name).append(",1\n");
+                            } else {
+                                data.append("EQUIP[").append(i).append("]: ").append(equipment[i]).append(",1\n");
+                            }
                         } else {
                             data.append("EQUIP[").append(i).append("]: 0,0\n");
                         }

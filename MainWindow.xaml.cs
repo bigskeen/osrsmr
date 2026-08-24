@@ -1,7 +1,11 @@
-﻿using System.Collections.ObjectModel;
+﻿using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
@@ -488,6 +492,8 @@ public partial class MainWindow : Window
                             qty = parsedQty;
                         }
 
+                        displayText = ItemDatabase.ResolveItemName(displayText);
+
                         string toolTipText = qty > 1 ? $"{displayText} (x{qty})" : displayText;
                         string labelText = qty > 1 ? $"{displayText}\nx{qty}" : displayText;
 
@@ -537,6 +543,8 @@ public partial class MainWindow : Window
                         {
                             qty = parsedQty;
                         }
+
+                        displayText = ItemDatabase.ResolveItemName(displayText);
 
                         string toolTipText = qty > 1 ? $"{displayText} (x{qty})" : displayText;
                         string labelText = qty > 1 ? $"{displayText}\nx{qty}" : displayText;
@@ -1246,4 +1254,354 @@ public class PlayerItem
     public string Name { get; set; } = "";
     public string Distance { get; set; } = "";
     public string CombatLevel { get; set; } = "";
+}
+
+public static class ItemDatabase
+{
+    private static readonly ConcurrentDictionary<int, string> _items = new();
+    private static readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(10) };
+
+    static ItemDatabase()
+    {
+        InitializeStaticItems();
+        Task.Run(InitializeOnlineMappingAsync);
+    }
+
+    public static string ResolveItemName(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return "";
+        if (int.TryParse(input, out int id))
+        {
+            return GetItemName(id);
+        }
+        return input;
+    }
+
+    public static string GetItemName(int id)
+    {
+        if (id <= 0) return "";
+        if (_items.TryGetValue(id, out var name))
+        {
+            return name;
+        }
+        return id.ToString();
+    }
+
+    private static void InitializeStaticItems()
+    {
+        _items[995] = "Coins";
+        _items[1351] = "Bronze axe";
+        _items[1349] = "Iron axe";
+        _items[1353] = "Steel axe";
+        _items[1355] = "Mithril axe";
+        _items[1357] = "Adamant axe";
+        _items[1359] = "Rune axe";
+        _items[6739] = "Dragon axe";
+        _items[1265] = "Bronze pickaxe";
+        _items[1267] = "Iron pickaxe";
+        _items[1269] = "Steel pickaxe";
+        _items[1273] = "Mithril pickaxe";
+        _items[1271] = "Adamant pickaxe";
+        _items[1275] = "Rune pickaxe";
+        _items[11920] = "Dragon pickaxe";
+        _items[303] = "Small fishing net";
+        _items[307] = "Fishing rod";
+        _items[309] = "Fly fishing rod";
+        _items[311] = "Harpoon";
+        _items[301] = "Lobster pot";
+        _items[313] = "Fishing bait";
+        _items[314] = "Feather";
+        _items[590] = "Tinderbox";
+        _items[1755] = "Chisel";
+        _items[2347] = "Hammer";
+        _items[1733] = "Needle";
+        _items[1734] = "Thread";
+        _items[946] = "Knife";
+        _items[1925] = "Bucket";
+        _items[1929] = "Bucket of water";
+        _items[1935] = "Jug";
+        _items[1937] = "Jug of water";
+        _items[227] = "Vial of water";
+        _items[229] = "Vial";
+        _items[554] = "Fire rune";
+        _items[555] = "Water rune";
+        _items[556] = "Air rune";
+        _items[557] = "Earth rune";
+        _items[558] = "Mind rune";
+        _items[559] = "Body rune";
+        _items[560] = "Death rune";
+        _items[561] = "Nature rune";
+        _items[562] = "Chaos rune";
+        _items[563] = "Law rune";
+        _items[564] = "Cosmic rune";
+        _items[565] = "Blood rune";
+        _items[566] = "Soul rune";
+        _items[21880] = "Wrath rune";
+        _items[9075] = "Astral rune";
+        _items[315] = "Shrimps";
+        _items[325] = "Salmon";
+        _items[329] = "Salmon";
+        _items[333] = "Trout";
+        _items[377] = "Lobster";
+        _items[379] = "Lobster";
+        _items[383] = "Raw shark";
+        _items[385] = "Shark";
+        _items[386] = "Shark (noted)";
+        _items[395] = "Sea turtle";
+        _items[397] = "Sea turtle";
+        _items[389] = "Manta ray";
+        _items[391] = "Manta ray";
+        _items[3144] = "Cooked karambwan";
+        _items[13441] = "Anglerfish";
+        _items[11936] = "Dark crab";
+        _items[7946] = "Monkfish";
+        _items[2434] = "Prayer potion(4)";
+        _items[139] = "Prayer potion(3)";
+        _items[141] = "Prayer potion(2)";
+        _items[143] = "Prayer potion(1)";
+        _items[6685] = "Saradomin brew(4)";
+        _items[6687] = "Saradomin brew(3)";
+        _items[6689] = "Saradomin brew(2)";
+        _items[6691] = "Saradomin brew(1)";
+        _items[3024] = "Super restore(4)";
+        _items[3026] = "Super restore(3)";
+        _items[3028] = "Super restore(2)";
+        _items[3030] = "Super restore(1)";
+        _items[12625] = "Stamina potion(4)";
+        _items[12627] = "Stamina potion(3)";
+        _items[12629] = "Stamina potion(2)";
+        _items[12631] = "Stamina potion(1)";
+        _items[2440] = "Super strength(4)";
+        _items[157] = "Super strength(3)";
+        _items[159] = "Super strength(2)";
+        _items[161] = "Super strength(1)";
+        _items[2436] = "Super attack(4)";
+        _items[145] = "Super attack(3)";
+        _items[147] = "Super attack(2)";
+        _items[149] = "Super attack(1)";
+        _items[2442] = "Super defence(4)";
+        _items[163] = "Super defence(3)";
+        _items[165] = "Super defence(2)";
+        _items[167] = "Super defence(1)";
+        _items[2444] = "Ranging potion(4)";
+        _items[169] = "Ranging potion(3)";
+        _items[171] = "Ranging potion(2)";
+        _items[173] = "Ranging potion(1)";
+        _items[3040] = "Magic potion(4)";
+        _items[3042] = "Magic potion(3)";
+        _items[3044] = "Magic potion(2)";
+        _items[3046] = "Magic potion(1)";
+        _items[12695] = "Super combat potion(4)";
+        _items[12697] = "Super combat potion(3)";
+        _items[12699] = "Super combat potion(2)";
+        _items[12701] = "Super combat potion(1)";
+        _items[23685] = "Divine super combat potion(4)";
+        _items[23688] = "Divine super combat potion(3)";
+        _items[23691] = "Divine super combat potion(2)";
+        _items[23694] = "Divine super combat potion(1)";
+        _items[4151] = "Abyssal whip";
+        _items[12006] = "Abyssal tentacle";
+        _items[1305] = "Dragon longsword";
+        _items[4587] = "Dragon scimitar";
+        _items[1377] = "Dragon battleaxe";
+        _items[1215] = "Dragon dagger";
+        _items[5698] = "Dragon dagger(p++)";
+        _items[11802] = "Armadyl godsword";
+        _items[11804] = "Bandos godsword";
+        _items[11806] = "Saradomin godsword";
+        _items[11808] = "Zamorak godsword";
+        _items[11832] = "Bandos chestplate";
+        _items[11834] = "Bandos tassets";
+        _items[11836] = "Bandos boots";
+        _items[11826] = "Armadyl helmet";
+        _items[11828] = "Armadyl chestplate";
+        _items[11830] = "Armadyl chainskirt";
+        _items[11840] = "Dragon boots";
+        _items[21736] = "Primordial boots";
+        _items[21742] = "Pegasian boots";
+        _items[21748] = "Eternal boots";
+        _items[6585] = "Amulet of fury";
+        _items[19553] = "Amulet of torture";
+        _items[19547] = "Necklace of anguish";
+        _items[19544] = "Tormented bracelet";
+        _items[19550] = "Ring of suffering";
+        _items[1704] = "Amulet of glory";
+        _items[1712] = "Amulet of glory(4)";
+        _items[11978] = "Amulet of glory(6)";
+        _items[1725] = "Amulet of strength";
+        _items[1727] = "Amulet of magic";
+        _items[1731] = "Amulet of power";
+        _items[6737] = "Berserker ring";
+        _items[11773] = "Berserker ring (i)";
+        _items[6731] = "Seers ring";
+        _items[11770] = "Seers ring (i)";
+        _items[6733] = "Archers ring";
+        _items[11771] = "Archers ring (i)";
+        _items[6735] = "Warrior ring";
+        _items[11772] = "Warrior ring (i)";
+        _items[22975] = "Brimstone ring";
+        _items[7462] = "Barrows gloves";
+        _items[7461] = "Dragon gloves";
+        _items[7460] = "Rune gloves";
+        _items[10551] = "Fighter torso";
+        _items[1127] = "Rune platebody";
+        _items[1079] = "Rune platelegs";
+        _items[1093] = "Rune plateskirt";
+        _items[1163] = "Rune full helm";
+        _items[1201] = "Rune kiteshield";
+        _items[3140] = "Dragon chainbody";
+        _items[4087] = "Dragon platelegs";
+        _items[4585] = "Dragon plateskirt";
+        _items[1149] = "Dragon med helm";
+        _items[11838] = "Dragon defender";
+        _items[12954] = "Dragon defender (t)";
+        _items[8850] = "Rune defender";
+        _items[12926] = "Toxic blowpipe";
+        _items[12924] = "Toxic blowpipe (empty)";
+        _items[12934] = "Zulrah's scales";
+        _items[11283] = "Dragonfire shield";
+        _items[10499] = "Ava's accumulator";
+        _items[22109] = "Ava's assembler";
+        _items[25865] = "Bow of faerdhinen (c)";
+        _items[25867] = "Bow of faerdhinen";
+        _items[20997] = "Twisted bow";
+        _items[22325] = "Scythe of vitur";
+        _items[27275] = "Tumeken's shadow";
+        _items[4716] = "Dharok's helm";
+        _items[4718] = "Dharok's greataxe";
+        _items[4720] = "Dharok's platebody";
+        _items[4722] = "Dharok's platelegs";
+        _items[4708] = "Ahrim's hood";
+        _items[4710] = "Ahrim's staff";
+        _items[4712] = "Ahrim's robetop";
+        _items[4714] = "Ahrim's robeskirt";
+        _items[4724] = "Guthan's helm";
+        _items[4726] = "Guthan's warspear";
+        _items[4728] = "Guthan's platebody";
+        _items[4730] = "Guthan's chainskirt";
+        _items[4732] = "Karil's coif";
+        _items[4734] = "Karil's crossbow";
+        _items[4736] = "Karil's leathertop";
+        _items[4738] = "Karil's leatherskirt";
+        _items[4745] = "Torag's helm";
+        _items[4747] = "Torag's hammers";
+        _items[4749] = "Torag's platebody";
+        _items[4751] = "Torag's platelegs";
+        _items[4753] = "Verac's helm";
+        _items[4755] = "Verac's flail";
+        _items[4757] = "Verac's brassard";
+        _items[4759] = "Verac's plateskirt";
+        _items[11864] = "Slayer helmet";
+        _items[11865] = "Slayer helmet (i)";
+        _items[6570] = "Fire cape";
+        _items[21295] = "Infernal cape";
+        _items[13280] = "Max cape";
+        _items[436] = "Copper ore";
+        _items[438] = "Tin ore";
+        _items[440] = "Iron ore";
+        _items[442] = "Silver ore";
+        _items[444] = "Gold ore";
+        _items[447] = "Mithril ore";
+        _items[449] = "Adamantite ore";
+        _items[451] = "Runite ore";
+        _items[453] = "Coal";
+        _items[2349] = "Bronze bar";
+        _items[2351] = "Iron bar";
+        _items[2353] = "Steel bar";
+        _items[2355] = "Silver bar";
+        _items[2357] = "Gold bar";
+        _items[2359] = "Mithril bar";
+        _items[2361] = "Adamantite bar";
+        _items[2363] = "Runite bar";
+        _items[1511] = "Logs";
+        _items[1521] = "Oak logs";
+        _items[1519] = "Willow logs";
+        _items[6333] = "Teak logs";
+        _items[1517] = "Maple logs";
+        _items[6332] = "Mahogany logs";
+        _items[1515] = "Yew logs";
+        _items[1513] = "Magic logs";
+        _items[19669] = "Redwood logs";
+        _items[526] = "Bones";
+        _items[532] = "Big bones";
+        _items[536] = "Dragon bones";
+        _items[22124] = "Superior dragon bones";
+        _items[199] = "Grimy guam leaf";
+        _items[201] = "Grimy marrentill";
+        _items[203] = "Grimy tarromin";
+        _items[205] = "Grimy harralander";
+        _items[207] = "Grimy ranarr weed";
+        _items[209] = "Grimy irit leaf";
+        _items[211] = "Grimy avantoe";
+        _items[213] = "Grimy kwuarm";
+        _items[215] = "Grimy cadantine";
+        _items[217] = "Grimy dwarf weed";
+        _items[219] = "Grimy torstol";
+        _items[3049] = "Grimy toadflax";
+        _items[3051] = "Grimy snapdragon";
+        _items[8007] = "Varrock teleport";
+        _items[8008] = "Lumbridge teleport";
+        _items[8009] = "Falador teleport";
+        _items[8010] = "Camelot teleport";
+        _items[8011] = "Ardougne teleport";
+        _items[8013] = "Teleport to house";
+    }
+
+    private static async Task InitializeOnlineMappingAsync()
+    {
+        try
+        {
+            string cacheDir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "osrsmr");
+            Directory.CreateDirectory(cacheDir);
+            string cacheFile = System.IO.Path.Combine(cacheDir, "items_mapping.json");
+
+            if (File.Exists(cacheFile))
+            {
+                try
+                {
+                    string cachedJson = await File.ReadAllTextAsync(cacheFile);
+                    LoadFromJson(cachedJson);
+                }
+                catch { }
+            }
+
+            _httpClient.DefaultRequestHeaders.UserAgent.Clear();
+            _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("osrsmr - osrs item mapping helper");
+            string json = await _httpClient.GetStringAsync("https://prices.runescape.wiki/api/v1/osrs/mapping");
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                LoadFromJson(json);
+                try
+                {
+                    await File.WriteAllTextAsync(cacheFile, json);
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    private static void LoadFromJson(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in doc.RootElement.EnumerateArray())
+                {
+                    if (el.TryGetProperty("id", out var idProp) && el.TryGetProperty("name", out var nameProp))
+                    {
+                        int id = idProp.GetInt32();
+                        string? name = nameProp.GetString();
+                        if (id > 0 && !string.IsNullOrWhiteSpace(name))
+                        {
+                            _items[id] = name;
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+    }
 }
