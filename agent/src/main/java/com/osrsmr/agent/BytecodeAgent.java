@@ -150,6 +150,9 @@ public class BytecodeAgent {
                             } catch (Throwable t) {
                                 runeLiteSuccess = false;
                             }
+                            if (!runeLiteSuccess) {
+                                runeLiteClient = null;
+                            }
                         }
 
                         // 3. Fallback to Obfuscated / Heuristic Extraction
@@ -254,22 +257,26 @@ public class BytecodeAgent {
                                         getAllBindings.setAccessible(true);
                                         Map<?, ?> map = (Map<?, ?>) getAllBindings.invoke(injector);
                                         if (map != null) {
-                                            for (Object binding : map.values()) {
-                                                try {
-                                                    Method getProvider = binding.getClass().getMethod("getProvider");
-                                                    getProvider.setAccessible(true);
-                                                    Object provider = getProvider.invoke(binding);
-                                                    if (provider != null) {
-                                                        Method get = provider.getClass().getMethod("get");
-                                                        get.setAccessible(true);
-                                                        Object val = get.invoke(provider);
-                                                        if (val != null && isRuneLiteClientObject(val)) {
-                                                            runeLiteClient = val;
-                                                            System.out.println("[osrsmr] RuneLite Client acquired via Injector bindings!");
-                                                            break;
+                                            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                                                String keyStr = String.valueOf(entry.getKey());
+                                                if (keyStr.contains("net.runelite.api.Client") || keyStr.contains("RSClient")) {
+                                                    try {
+                                                        Object binding = entry.getValue();
+                                                        Method getProvider = binding.getClass().getMethod("getProvider");
+                                                        getProvider.setAccessible(true);
+                                                        Object provider = getProvider.invoke(binding);
+                                                        if (provider != null) {
+                                                            Method get = provider.getClass().getMethod("get");
+                                                            get.setAccessible(true);
+                                                            Object val = get.invoke(provider);
+                                                            if (val != null && isRuneLiteClientObject(val)) {
+                                                                runeLiteClient = val;
+                                                                System.out.println("[osrsmr] RuneLite Client acquired via Injector binding " + keyStr);
+                                                                break;
+                                                            }
                                                         }
-                                                    }
-                                                } catch (Throwable ignored) {}
+                                                    } catch (Throwable ignored) {}
+                                                }
                                             }
                                         }
                                     } catch (Throwable ignored) {}
@@ -479,31 +486,70 @@ public class BytecodeAgent {
         if (obj == null) return false;
         Class<?> cls = obj.getClass();
         String cName = cls.getName();
-        if (cName.equals("client") || cName.endsWith(".Client") || cName.contains("RSClient")) {
+
+        // Exclude UI and auxiliary components
+        if (cName.startsWith("net.runelite.client.ui.")
+                || cName.startsWith("net.runelite.client.plugins.")
+                || cName.startsWith("net.runelite.client.config.")
+                || cName.startsWith("net.runelite.client.chat.")
+                || cName.startsWith("net.runelite.client.task.")
+                || cName.startsWith("net.runelite.client.util.")
+                || cName.startsWith("net.runelite.client.menus.")
+                || cName.startsWith("net.runelite.client.discord.")
+                || cName.startsWith("net.runelite.client.ws.")
+                || cName.startsWith("net.runelite.client.events.")
+                || cName.equals("net.runelite.client.RuneLite")
+                || cName.contains("SessionManager")
+                || cName.contains("Toolbar")
+                || cName.contains("Panel")
+                || cName.contains("Loader")
+                || cName.contains("Thread")
+                || cName.contains("Manager")
+                || cName.contains("Injector")) {
+            return false;
+        }
+
+        // Direct class or interface matching
+        if (cName.equals("client") || cName.equals("net.runelite.client.Client")
+                || cName.equals("net.runelite.api.Client") || cName.equals("net.runelite.rs.api.RSClient")) {
             return true;
         }
-        
-        Class<?> curr = cls;
+
+        for (Class<?> iface : cls.getInterfaces()) {
+            String iName = iface.getName();
+            if (iName.equals("net.runelite.api.Client") || iName.equals("net.runelite.rs.api.RSClient") || iName.equals("client")) {
+                return true;
+            }
+        }
+
+        Class<?> curr = cls.getSuperclass();
         while (curr != null && curr != Object.class) {
-            if (curr.getName().contains("Client") || curr.getName().contains("RSClient")) {
+            String sName = curr.getName();
+            if (sName.equals("client") || sName.equals("net.runelite.rs.api.RSClient") || sName.equals("net.runelite.api.Client")) {
                 return true;
             }
             for (Class<?> iface : curr.getInterfaces()) {
-                if (iface.getName().contains("Client") || iface.getName().contains("RSClient")) {
+                String iName = iface.getName();
+                if (iName.equals("net.runelite.api.Client") || iName.equals("net.runelite.rs.api.RSClient")) {
                     return true;
                 }
             }
             curr = curr.getSuperclass();
         }
-        
+
+        // Method-based validation: Must have getGameState() AND one core client method
         try {
-            Method m = cls.getMethod("getGameState");
-            if (m != null) return true;
+            Method m1 = cls.getMethod("getGameState");
+            if (m1 != null) {
+                for (String mName : new String[]{"getLocalPlayer", "getCanvas", "getTopLevelWorldView", "getItemContainer", "getPlane"}) {
+                    try {
+                        Method m2 = cls.getMethod(mName);
+                        if (m2 != null) return true;
+                    } catch (Throwable ignored) {}
+                }
+            }
         } catch (Throwable ignored) {}
-        try {
-            Method m = cls.getMethod("getLocalPlayer");
-            if (m != null) return true;
-        } catch (Throwable ignored) {}
+
         return false;
     }
 
@@ -713,6 +759,31 @@ public class BytecodeAgent {
                         data.append("SKILL[").append(SKILL_NAMES[i]).append("]: ").append(real).append("\n");
                     }
                 }
+            } else {
+                try {
+                    Class<?> skillEnumClass = null;
+                    try {
+                        skillEnumClass = Class.forName("net.runelite.api.Skill", false, client.getClass().getClassLoader());
+                    } catch (Throwable ignored) {}
+                    if (skillEnumClass != null && skillEnumClass.isEnum()) {
+                        Object[] skillConstants = skillEnumClass.getEnumConstants();
+                        Method getRealSkill = null;
+                        Method getBoostedSkill = null;
+                        try { getRealSkill = client.getClass().getMethod("getRealSkillLevel", skillEnumClass); } catch (Throwable ignored) {}
+                        try { getBoostedSkill = client.getClass().getMethod("getBoostedSkillLevel", skillEnumClass); } catch (Throwable ignored) {}
+
+                        if (getRealSkill != null) {
+                            for (Object sc : skillConstants) {
+                                try {
+                                    String sName = ((Enum<?>) sc).name();
+                                    int real = (Integer) getRealSkill.invoke(client, sc);
+                                    int boosted = getBoostedSkill != null ? (Integer) getBoostedSkill.invoke(client, sc) : real;
+                                    data.append("SKILL[").append(sName).append("]: ").append(boosted).append("/").append(real).append("\n");
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
             }
 
             // World
