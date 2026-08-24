@@ -10,12 +10,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BytecodeAgent {
     private static final String VERSION = "1.3.3";
     private static final int PORT = 43594;
-    private static boolean heartbeatStarted = false;
+    private static volatile Thread heartbeatThread = null;
     private static final String JVM_PID = getPidInternal();
+    private static final ConcurrentHashMap<Integer, String> ITEM_NAME_CACHE = new ConcurrentHashMap<>();
 
     private static String getPidInternal() {
         try {
@@ -85,36 +87,23 @@ public class BytecodeAgent {
         initialize(inst);
     }
 
-    private static void initialize(Instrumentation inst) {
-        final String mySession = java.util.UUID.randomUUID().toString();
-        System.setProperty("osrsmr.agent.session", mySession);
-        System.setProperty("osrsmr.agent.version", VERSION);
-
-        synchronized (BytecodeAgent.class) {
-            if (heartbeatStarted) return;
-            heartbeatStarted = true;
+    private static synchronized void initialize(Instrumentation inst) {
+        if (heartbeatThread != null && heartbeatThread.isAlive()) {
+            System.out.println("[osrsmr] Agent already active and running (PID " + JVM_PID + ")");
+            return;
         }
 
-        new Thread(() -> {
+        heartbeatThread = new Thread(() -> {
             try {
                 // Wait briefly for client initialization
-                Thread.sleep(1500);
-                System.out.println("[osrsmr] Starting Discovery Agent v" + VERSION + " (session " + mySession + ")...");
+                Thread.sleep(1000);
+                System.out.println("[osrsmr] Starting Discovery Agent v" + VERSION + " (PID " + JVM_PID + ")...");
 
                 Socket socket = null;
                 OutputStream out = null;
 
                 while (true) {
                     try {
-                        String globalSession = System.getProperty("osrsmr.agent.session");
-                        if (globalSession != null && !globalSession.equals(mySession)) {
-                            System.out.println("[osrsmr] Newer agent session detected. Terminating older agent v" + VERSION);
-                            if (socket != null) {
-                                try { socket.close(); } catch (Exception ignored) {}
-                            }
-                            break;
-                        }
-
                         // 1. Scan loaded classes for RuneLite client or obfuscated fields
                         try {
                             scanAndDiscover(inst);
@@ -123,7 +112,7 @@ public class BytecodeAgent {
                         boolean hasGameClient = (runeLiteClient != null || foundClientClass != null || gameStateField != null || localPlayerField != null);
 
                         // If this JVM instance does not contain the game client yet,
-                        // do not disconnect if already hooked; keep scanning
+                        // keep scanning without crashing
                         if (!hasGameClient && inst != null) {
                             hasGameClient = true;
                         }
@@ -144,7 +133,7 @@ public class BytecodeAgent {
                                 System.out.println("[osrsmr] Connected to Bridge on port " + PORT + " (PID " + JVM_PID + ")");
                             } catch (Exception e) {
                                 // Bridge not ready yet
-                                Thread.sleep(2000);
+                                Thread.sleep(1500);
                                 continue;
                             }
                         }
@@ -190,7 +179,9 @@ public class BytecodeAgent {
             } catch (Exception e) {
                 e.printStackTrace();
             }
-        }, "osrsmr-heartbeat").start();
+        }, "osrsmr-heartbeat");
+        heartbeatThread.setDaemon(true);
+        heartbeatThread.start();
     }
 
     private static void scanAndDiscover(Instrumentation inst) {
@@ -975,6 +966,9 @@ public class BytecodeAgent {
 
     private static String resolveItemName(Object client, int id) {
         if (id <= 0 || client == null) return null;
+        String cached = ITEM_NAME_CACHE.get(id);
+        if (cached != null) return cached;
+
         try {
             for (String mName : new String[]{"getItemDefinition", "getItemComposition"}) {
                 try {
@@ -988,6 +982,7 @@ public class BytecodeAgent {
                         if (n instanceof String) {
                             String s = ((String) n).replaceAll("<[^>]*>", "").trim();
                             if (!s.isEmpty() && !s.equalsIgnoreCase("null")) {
+                                ITEM_NAME_CACHE.put(id, s);
                                 return s;
                             }
                         }

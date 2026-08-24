@@ -432,9 +432,9 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        var parts = value.Split(',');
-                        string displayText = parts[0].Trim();
-                        if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int qty) && qty > 1)
+                        int lastComma = value.LastIndexOf(',');
+                        string displayText = lastComma >= 0 ? value.Substring(0, lastComma).Trim() : value.Trim();
+                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int qty) && qty > 1)
                         {
                             displayText = $"{displayText} ({qty})";
                         }
@@ -476,9 +476,9 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        var parts = value.Split(',');
-                        string displayText = parts[0].Trim();
-                        if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int qty) && qty > 1)
+                        int lastComma = value.LastIndexOf(',');
+                        string displayText = lastComma >= 0 ? value.Substring(0, lastComma).Trim() : value.Trim();
+                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int qty) && qty > 1)
                         {
                             displayText = $"{displayText} ({qty})";
                         }
@@ -927,7 +927,6 @@ public partial class MainWindow : Window
                                 if (success)
                                 {
                                     _lastAttachedPid = pid.ToString();
-                                    _failedPidCooldown.Remove(pid);
 
                                     // Wait up to 3.5s for agent socket
                                     for (int i = 0; i < 7 && !_isAgentConnected; i++)
@@ -935,6 +934,9 @@ public partial class MainWindow : Window
                                         await Task.Delay(500);
                                     }
                                     if (_isAgentConnected) break;
+
+                                    // Give newly attached agent a 12-second grace period before attempting re-attach
+                                    _failedPidCooldown[pid] = DateTime.UtcNow;
                                 }
                                 else
                                 {
