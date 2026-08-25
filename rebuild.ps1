@@ -1,4 +1,14 @@
-﻿# 1. Build Agent
+﻿# 0. Close Old Running Instances
+Write-Host "Closing any existing osrsmr, RuneLite, and Java instances..."
+Get-Process | Where-Object { $_.ProcessName -match 'osrsmr|runelite|RuneLiteWrapper|javaw|java' } | ForEach-Object {
+    try {
+        if ($_.MainWindowTitle -match 'Rider' -or $_.Path -match 'JetBrains') { return }
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+Start-Sleep -Milliseconds 300
+
+# 1. Build Agent
 $localAppData = $env:LOCALAPPDATA
 $javac = "C:\Program Files\JetBrains\JetBrains Rider 2026.1.2\jbr\bin\javac.exe"
 $jar = "C:\Program Files\JetBrains\JetBrains Rider 2026.1.2\jbr\bin\jar.exe"
@@ -49,13 +59,24 @@ Get-ChildItem -Path $outDir -Recurse | Where-Object { -not $_.PSIsContainer } | 
 $zip.Dispose()
 
 cd $rootDir
-Copy-Item "agent/agent.jar" "agent.jar" -Force
-Copy-Item "agent/agent.jar" "bin/Release/net9.0-windows/agent.jar" -Force
-Copy-Item "agent/agent.jar" "bin/Debug/net9.0-windows/agent.jar" -Force
+try { Copy-Item "agent/agent.jar" "agent.jar" -Force -ErrorAction Stop } catch { Write-Warning "Could not overwrite root agent.jar: $($_.Exception.Message)" }
+try { Copy-Item "agent/agent.jar" "bin/Release/net9.0-windows/agent.jar" -Force -ErrorAction Stop } catch { Write-Warning "Could not overwrite bin/Release agent.jar: $($_.Exception.Message)" }
+try { Copy-Item "agent/agent.jar" "bin/Debug/net9.0-windows/agent.jar" -Force -ErrorAction Stop } catch { Write-Warning "Could not overwrite bin/Debug agent.jar: $($_.Exception.Message)" }
+try { if (Test-Path "$localAppData\RuneLite") { Copy-Item "agent/agent.jar" "$localAppData\RuneLite\agent.jar" -Force -ErrorAction SilentlyContinue } } catch { }
+try { if (Test-Path "$env:USERPROFILE\.runelite") { Copy-Item "agent/agent.jar" "$env:USERPROFILE\.runelite\agent.jar" -Force -ErrorAction SilentlyContinue } } catch { }
 
-# 3. Build Bridge
+# 3. Build Wrapper
+Write-Host "Building RuneLite Jagex Proxy Wrapper..."
+$csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (Test-Path "$PSScriptRoot\RuneLiteWrapper.cs") {
+    & $csc /target:winexe /out:"$PSScriptRoot\RuneLiteWrapper.exe" /optimize+ "$PSScriptRoot\RuneLiteWrapper.cs"
+    Copy-Item "$PSScriptRoot\RuneLiteWrapper.exe" "$PSScriptRoot\bin\Release\net9.0-windows\RuneLiteWrapper.exe" -Force
+    Copy-Item "$PSScriptRoot\RuneLiteWrapper.exe" "$PSScriptRoot\bin\Debug\net9.0-windows\RuneLiteWrapper.exe" -Force
+}
+
+# 4. Build Bridge
 Write-Host "Building C# Bridge..."
 dotnet build osrsmr.csproj -c Release
 
-# 4. Update Shortcut
+# 5. Update Shortcut
 ./create_shortcut.ps1

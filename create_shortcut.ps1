@@ -20,7 +20,10 @@ $ExeShortcut.Save()
 # 3. RuneLite Desktop Shortcut with Bridge Hook
 $RuneLiteExe = "$env:LOCALAPPDATA\RuneLite\RuneLite.exe"
 if (Test-Path $RuneLiteExe) {
-    $AgentJar = "$PSScriptRoot\bin\Release\net9.0-windows\agent.jar"
+    $AgentJar = "$PSScriptRoot\agent.jar"
+    if (-not (Test-Path $AgentJar)) {
+        $AgentJar = "$PSScriptRoot\bin\Release\net9.0-windows\agent.jar"
+    }
     $RlShortcut = $WshShell.CreateShortcut("$DesktopPath\RuneLite.lnk")
     $RlShortcut.TargetPath = $RuneLiteExe
     $RlShortcut.Arguments = "-J-XX:-DisableAttachMechanism -J-javaagent:`"$AgentJar`""

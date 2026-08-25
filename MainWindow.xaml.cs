@@ -11,6 +11,14 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Shapes;
+using System.Windows.Threading;
+using OsrsMr.Core;
+using OsrsMr.Api;
+using OsrsMr.Api.Entities;
+using OsrsMr.Api.Framework;
+using OsrsMr.Api.CustomScripts;
+using OsrsMr.Scripts;
+using OsrsMr;
 
 namespace osrsmr;
 
@@ -21,18 +29,38 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<NpcItem> _npcs = new();
     private readonly ObservableCollection<PlayerItem> _players = new();
     private readonly ObservableCollection<PrayerViewModel> _prayers = new();
+    private readonly ObservableCollection<TreeItem> _trees = new();
+    private readonly ObservableCollection<SceneObjectItem> _banks = new();
+    private readonly ObservableCollection<SceneObjectItem> _shops = new();
+    private readonly ObservableCollection<SceneObjectItem> _altars = new();
+    private readonly ObservableCollection<SceneObjectItem> _rocks = new();
+    private readonly ObservableCollection<GroundItem> _groundItems = new();
+    private readonly ObservableCollection<ContainerItem> _bankItems = new();
+    private readonly ObservableCollection<ContainerItem> _shopItems = new();
+    private readonly ObservableCollection<ShortcutItem> _shortcuts = new();
+    private readonly ObservableCollection<AgilityObstacleItem> _agilityObstacles = new();
+    private readonly ObservableCollection<FishingSpotItem> _fishingSpots = new();
+    private readonly ObservableCollection<CustomActionStep> _creatorSteps = new();
+    private readonly ObservableCollection<NpcItem> _creatorNearbyNpcs = new();
+    private readonly ObservableCollection<MonsterLootItem> _creatorLootTable = new();
+    private readonly ObservableCollection<string> _creatorActiveLootList = new();
+    private readonly List<CustomScriptDefinition> _savedCustomScripts = new();
     private readonly Dictionary<string, PrayerViewModel> _prayerMap = new(StringComparer.OrdinalIgnoreCase);
     private readonly Border[] _inventorySlots = new Border[28];
     private readonly Dictionary<string, Border> _equipmentSlots = new();
+    private readonly DispatcherTimer _botTimer = new();
     private TcpListener? _listener;
     private bool _running = true;
     private volatile bool _isAgentConnected = false;
+    private volatile bool _isTcpConnected = false;
     private TcpClient? _activeTcpClient = null;
     private int _activeSessionId = 0;
     private string? _lastAttachedPid = null;
     private readonly Dictionary<int, DateTime> _failedPidCooldown = new();
     private static readonly object _logLock = new();
     private string? _cachedJavaPath = null;
+    private System.Diagnostics.Process? _trackedRuneLiteProcess = null;
+    private readonly object _processTrackLock = new();
 
     [DllImport("kernel32.dll")]
     public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
@@ -42,6 +70,13 @@ public partial class MainWindow : Window
 
     [DllImport("kernel32.dll")]
     public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+
+    private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+    private const uint WM_SETTINGCHANGE = 0x001A;
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
 
     private const int PROCESS_WM_READ = 0x0010;
 
@@ -54,16 +89,34 @@ public partial class MainWindow : Window
             SkillsControl.ItemsSource = _skills;
             NpcList.ItemsSource = _npcs;
             PlayerList.ItemsSource = _players;
+            TreesList.ItemsSource = _trees;
+            BanksList.ItemsSource = _banks;
+            ShopsList.ItemsSource = _shops;
+            AltarsList.ItemsSource = _altars;
+            RocksList.ItemsSource = _rocks;
+            GroundItemsList.ItemsSource = _groundItems;
+            BankContainerList.ItemsSource = _bankItems;
+            ShopContainerList.ItemsSource = _shopItems;
+            ShortcutsList.ItemsSource = _shortcuts;
+            WorldShortcutsList.ItemsSource = _shortcuts;
+            AgilityObstaclesList.ItemsSource = _agilityObstacles;
+            WorldAgilityObstaclesList.ItemsSource = _agilityObstacles;
+            FishingSpotsList.ItemsSource = _fishingSpots;
             InitializePrayers();
             InitializeInventoryGrid();
             InitializeEquipmentMapping();
+            InitializeBotController();
+            InitializeScriptCreator();
+
+            SyncAgentJar();
             StartServer();
             StartAutoAttachLoop();
             Task.Run(() => FixRuneLiteShortcut());
+            Task.Run(() => CheckAndFixRuneLiteConfig(silent: true));
             
             // Log environment info
             _dataItems.Add(new DataItem { Key = "OS", Value = RuntimeInformation.OSDescription });
-            _dataItems.Add(new DataItem { Key = "Bridge Version", Value = "1.2.0" });
+            _dataItems.Add(new DataItem { Key = "Bridge Version", Value = "2.0.0 (RuneLite JVM Bridge)" });
         }
         catch (Exception ex)
         {
@@ -144,7 +197,9 @@ public partial class MainWindow : Window
             while (_running)
             {
                 var client = await _listener.AcceptTcpClientAsync();
-                HandleClient(client);
+                client.NoDelay = true;
+                client.ReceiveBufferSize = 65536;
+                _ = Task.Run(() => HandleClient(client));
             }
         }
         catch (Exception ex)
@@ -153,7 +208,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void HandleClient(TcpClient client)
+    private async Task HandleClient(TcpClient client)
     {
         int sessionId = Interlocked.Increment(ref _activeSessionId);
         try
@@ -162,24 +217,43 @@ public partial class MainWindow : Window
         }
         catch { }
         _activeTcpClient = client;
+        _isTcpConnected = true;
         _isAgentConnected = true;
 
-        Dispatcher.Invoke(() => UpdateStatus("Agent Connected & Linked!", Brushes.Lime));
+        Dispatcher.BeginInvoke(() => UpdateStatus("Agent Connected & Linked!", Brushes.Lime));
         LogMessage($"[BRIDGE] Agent client #{sessionId} connected to TCP port 43594.");
+
+        // Track candidate RuneLite process if not already tracked
+        try
+        {
+            if (_trackedRuneLiteProcess == null || _trackedRuneLiteProcess.HasExited)
+            {
+                var candidates = FindRuneLiteCandidateProcesses();
+                if (candidates.Count > 0)
+                {
+                    TrackRuneLiteProcess(candidates[0].Id);
+                }
+            }
+        }
+        catch { }
         
         // Update diagnostic info
-        Dispatcher.Invoke(() => {
+        Dispatcher.BeginInvoke(() => {
             var existing = _dataItems.FirstOrDefault(i => i.Key == "Agent Link");
             string val = $"Connected (#{sessionId}) at {DateTime.Now.ToLongTimeString()}";
             if (existing != null) existing.Value = val;
             else _dataItems.Add(new DataItem { Key = "Agent Link", Value = val });
+
+            var clientMode = _dataItems.FirstOrDefault(i => i.Key == "Client Mode");
+            if (clientMode != null) clientMode.Value = "RuneLite Java Agent";
+            else _dataItems.Add(new DataItem { Key = "Client Mode", Value = "RuneLite Java Agent" });
         });
 
         try
         {
             using (client)
             using (var stream = client.GetStream())
-            using (var reader = new System.IO.StreamReader(stream, System.Text.Encoding.UTF8))
+            using (var reader = new System.IO.StreamReader(stream, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 65536))
             {
                 while (_running && client.Connected && sessionId == _activeSessionId)
                 {
@@ -206,17 +280,22 @@ public partial class MainWindow : Window
         {
             if (sessionId == _activeSessionId)
             {
+                _isTcpConnected = false;
                 _isAgentConnected = false;
                 LogMessage($"[BRIDGE] Agent client #{sessionId} disconnected.");
-                Dispatcher.Invoke(() => UpdateStatus("Agent Disconnected - Scanning for RuneLite...", Brushes.Yellow));
+                Dispatcher.BeginInvoke(() => UpdateStatus("Agent Disconnected - Waiting for Client...", Brushes.Yellow));
             }
         }
     }
 
     private void ProcessLine(string line)
     {
-        Dispatcher.Invoke((Action)(() =>
+        try { BrainEngine.Instance.ProcessLine(line); } catch { }
+
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, (Action)(() =>
         {
+            try
+            {
             if (line.Contains(":"))
             {
                 var parts = line.Split(':', 2);
@@ -374,6 +453,13 @@ public partial class MainWindow : Window
                 {
                     UpdateSpellbook(value);
                 }
+                else if (key == "SPELLBOOK_ID")
+                {
+                    if (string.IsNullOrEmpty(SpellbookText.Text) || SpellbookText.Text == "Standard")
+                    {
+                        UpdateSpellbook(value);
+                    }
+                }
                 else if (key == "AUTOCAST_SPELL")
                 {
                     AutocastSpellText.Text = value;
@@ -412,6 +498,236 @@ public partial class MainWindow : Window
                     else
                         _dataItems.Add(new DataItem { Key = key, Value = value });
                 }
+                else if (key.StartsWith("TREE["))
+                {
+                    UpdateTreeList(key, value);
+                }
+                else if (key == "TOTAL_TREES")
+                {
+                    if (int.TryParse(value, out int totalTrees))
+                    {
+                        while (_trees.Count > totalTrees)
+                            _trees.RemoveAt(_trees.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("BANK_OBJ["))
+                {
+                    UpdateBankObjList(key, value);
+                }
+                else if (key == "TOTAL_BANKS")
+                {
+                    if (int.TryParse(value, out int totalBanks))
+                    {
+                        while (_banks.Count > totalBanks)
+                            _banks.RemoveAt(_banks.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("SHOP_OBJ["))
+                {
+                    UpdateShopObjList(key, value);
+                }
+                else if (key == "TOTAL_SHOPS")
+                {
+                    if (int.TryParse(value, out int totalShops))
+                    {
+                        while (_shops.Count > totalShops)
+                            _shops.RemoveAt(_shops.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("ALTAR_OBJ["))
+                {
+                    UpdateAltarObjList(key, value);
+                }
+                else if (key == "TOTAL_ALTARS")
+                {
+                    if (int.TryParse(value, out int totalAltars))
+                    {
+                        while (_altars.Count > totalAltars)
+                            _altars.RemoveAt(_altars.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("ROCK_OBJ["))
+                {
+                    UpdateRockObjList(key, value);
+                }
+                else if (key == "TOTAL_ROCKS")
+                {
+                    if (int.TryParse(value, out int totalRocks))
+                    {
+                        while (_rocks.Count > totalRocks)
+                            _rocks.RemoveAt(_rocks.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("GROUND_ITEM["))
+                {
+                    UpdateGroundItemList(key, value);
+                }
+                else if (key == "TOTAL_GROUND_ITEMS")
+                {
+                    if (int.TryParse(value, out int totalGroundItems))
+                    {
+                        while (_groundItems.Count > totalGroundItems)
+                            _groundItems.RemoveAt(_groundItems.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("BANK_ITEM["))
+                {
+                    UpdateBankContainerItem(key, value);
+                }
+                else if (key == "BANK_OPEN")
+                {
+                    UpdateBankStatus(value);
+                }
+                else if (key == "BANK_TOTAL_ITEMS")
+                {
+                    if (BankItemCountText != null) BankItemCountText.Text = $"{value} Items Loaded";
+                    if (int.TryParse(value, out int totalBankItems))
+                    {
+                        while (_bankItems.Count > totalBankItems)
+                            _bankItems.RemoveAt(_bankItems.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("SHOP_ITEM["))
+                {
+                    UpdateShopContainerItem(key, value);
+                }
+                else if (key == "SHOP_OPEN")
+                {
+                    UpdateShopStatus(value);
+                }
+                else if (key == "SHOP_NAME")
+                {
+                    if (ShopTitleText != null) ShopTitleText.Text = value;
+                }
+                else if (key == "SHOP_TOTAL_ITEMS")
+                {
+                    if (ShopItemCountText != null) ShopItemCountText.Text = $"{value} Items In Stock";
+                    if (int.TryParse(value, out int totalShopItems))
+                    {
+                        while (_shopItems.Count > totalShopItems)
+                            _shopItems.RemoveAt(_shopItems.Count - 1);
+                    }
+                }
+                else if (key == "SPECIAL_ATTACK_PERCENT" || key == "SPECIAL_ATTACK_ENERGY")
+                {
+                    UpdateSpecialAttack(value);
+                }
+                else if (key == "SPECIAL_ATTACK_ACTIVE")
+                {
+                    UpdateSpecialAttackActive(value);
+                }
+                else if (key == "SLAYER_TASK")
+                {
+                    UpdateSlayerTask(value);
+                }
+                else if (key == "SLAYER_COUNT")
+                {
+                    UpdateSlayerCount(value);
+                }
+                else if (key == "SLAYER_POINTS")
+                {
+                    if (SlayerPointsText != null) SlayerPointsText.Text = value;
+                }
+                else if (key == "SLAYER_STREAK")
+                {
+                    if (SlayerStreakText != null) SlayerStreakText.Text = $"{value} Tasks Completed";
+                }
+                else if (key == "SLAYER_MASTER_NEARBY")
+                {
+                    if (SlayerMasterNearbyText != null) SlayerMasterNearbyText.Text = value;
+                }
+                else if (key == "DIALOG_ACTIVE")
+                {
+                    UpdateDialogActive(value);
+                }
+                else if (key == "DIALOG_TYPE")
+                {
+                    UpdateDialogType(value);
+                }
+                else if (key == "DIALOG_TITLE")
+                {
+                    UpdateDialogTitle(value);
+                }
+                else if (key == "DIALOG_TEXT")
+                {
+                    UpdateDialogText(value);
+                }
+                else if (key == "DIALOG_OPTIONS")
+                {
+                    UpdateDialogOptions(value);
+                }
+                else if (key.StartsWith("SHORTCUT["))
+                {
+                    UpdateShortcutList(key, value);
+                }
+                else if (key == "TOTAL_SHORTCUTS")
+                {
+                    if (int.TryParse(value, out int totalShortcuts))
+                    {
+                        while (_shortcuts.Count > totalShortcuts)
+                            _shortcuts.RemoveAt(_shortcuts.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("AGILITY_OBSTACLE["))
+                {
+                    UpdateAgilityObstacleList(key, value);
+                }
+                else if (key == "TOTAL_AGILITY_OBSTACLES")
+                {
+                    if (int.TryParse(value, out int totalObstacles))
+                    {
+                        while (_agilityObstacles.Count > totalObstacles)
+                            _agilityObstacles.RemoveAt(_agilityObstacles.Count - 1);
+                    }
+                }
+                else if (key.StartsWith("FISHING_SPOT["))
+                {
+                    UpdateFishingSpotList(key, value);
+                }
+                else if (key == "TOTAL_FISHING_SPOTS")
+                {
+                    if (int.TryParse(value, out int totalFish))
+                    {
+                        while (_fishingSpots.Count > totalFish)
+                            _fishingSpots.RemoveAt(_fishingSpots.Count - 1);
+                        if (FishingSpotsSummaryText != null)
+                            FishingSpotsSummaryText.Text = $"{totalFish} Fishing Spot{(totalFish == 1 ? "" : "s")} Detected";
+                        if (PlayerFishingText != null)
+                            PlayerFishingText.Text = totalFish > 0 ? $"{totalFish} Nearby" : "0 Nearby";
+                    }
+                }
+                else if (key == "AGILITY_COURSE")
+                {
+                    UpdateAgilityCourse(value);
+                }
+                else if (key == "AGILITY_COURSE_LEVEL")
+                {
+                    UpdateAgilityCourseLevel(value);
+                }
+                else if (key == "MARKS_OF_GRACE_COUNT")
+                {
+                    UpdateMarksOfGrace(value);
+                }
+                else if (key == "MINIGAME_ACTIVE")
+                {
+                    UpdateMinigameActive(value);
+                }
+                else if (key == "MINIGAME_NAME")
+                {
+                    UpdateMinigameName(value);
+                }
+                else if (key == "MINIGAME_STATUS")
+                {
+                    if (MinigameStatusText != null) MinigameStatusText.Text = value;
+                }
+                else if (key == "MINIGAME_POINTS")
+                {
+                    if (MinigamePointsText != null) MinigamePointsText.Text = value;
+                }
+                else if (key == "MINIGAME_EXTRA")
+                {
+                    if (MinigameExtraText != null) MinigameExtraText.Text = value;
+                }
                 else
                 {
                     var existing = _dataItems.FirstOrDefault(i => i.Key == key);
@@ -421,6 +737,8 @@ public partial class MainWindow : Window
                         _dataItems.Add(new DataItem { Key = key, Value = value });
                 }
             }
+            }
+            catch { }
         }));
     }
 
@@ -446,30 +764,80 @@ public partial class MainWindow : Window
 
     private void UpdateSpellbook(string value)
     {
-        SpellbookText.Text = value;
-        switch (value.ToLowerInvariant())
+        if (string.IsNullOrWhiteSpace(value)) return;
+
+        string normalized = value.Trim();
+        string displayName = normalized;
+        SolidColorBrush bgBrush;
+        SolidColorBrush fgBrush;
+
+        switch (normalized.ToLowerInvariant())
         {
             case "standard":
-                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(30, 57, 42));
-                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(76, 175, 80));
+            case "modern":
+            case "0":
+                displayName = "Standard";
+                bgBrush = new SolidColorBrush(Color.FromRgb(30, 57, 42));
+                fgBrush = new SolidColorBrush(Color.FromRgb(76, 175, 80));
                 break;
             case "ancient magicks":
             case "ancient":
-                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(50, 30, 65));
-                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(186, 104, 200));
+            case "ancients":
+            case "1":
+                displayName = "Ancient Magicks";
+                bgBrush = new SolidColorBrush(Color.FromRgb(50, 30, 65));
+                fgBrush = new SolidColorBrush(Color.FromRgb(186, 104, 200));
                 break;
             case "lunar":
-                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(25, 45, 70));
-                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(100, 181, 246));
+            case "lunar spellbook":
+            case "2":
+                displayName = "Lunar";
+                bgBrush = new SolidColorBrush(Color.FromRgb(25, 45, 70));
+                fgBrush = new SolidColorBrush(Color.FromRgb(100, 181, 246));
                 break;
             case "arceuus":
-                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(65, 45, 25));
-                SpellbookText.Foreground = new SolidColorBrush(Color.FromRgb(255, 183, 77));
+            case "necromancy":
+            case "3":
+                displayName = "Arceuus";
+                bgBrush = new SolidColorBrush(Color.FromRgb(65, 45, 25));
+                fgBrush = new SolidColorBrush(Color.FromRgb(255, 183, 77));
+                break;
+            case "ancient (swap)":
+            case "4":
+                displayName = "Ancient (Swap)";
+                bgBrush = new SolidColorBrush(Color.FromRgb(65, 25, 45));
+                fgBrush = new SolidColorBrush(Color.FromRgb(255, 105, 180));
+                break;
+            case "lunar (swap)":
+            case "5":
+                displayName = "Lunar (Swap)";
+                bgBrush = new SolidColorBrush(Color.FromRgb(25, 60, 65));
+                fgBrush = new SolidColorBrush(Color.FromRgb(80, 227, 194));
+                break;
+            case "arceuus (swap)":
+            case "6":
+                displayName = "Arceuus (Swap)";
+                bgBrush = new SolidColorBrush(Color.FromRgb(65, 50, 20));
+                fgBrush = new SolidColorBrush(Color.FromRgb(255, 215, 0));
                 break;
             default:
-                SpellbookBadge.Background = new SolidColorBrush(Color.FromRgb(40, 40, 40));
-                SpellbookText.Foreground = Brushes.White;
+                bgBrush = new SolidColorBrush(Color.FromRgb(40, 40, 40));
+                fgBrush = Brushes.White;
                 break;
+        }
+
+        if (SpellbookText != null) SpellbookText.Text = displayName;
+        if (SpellbookBadge != null)
+        {
+            SpellbookBadge.Background = bgBrush;
+            if (SpellbookText != null) SpellbookText.Foreground = fgBrush;
+        }
+
+        if (PlayerSpellbookText != null) PlayerSpellbookText.Text = displayName;
+        if (PlayerSpellbookBadge != null)
+        {
+            PlayerSpellbookBadge.Background = bgBrush;
+            if (PlayerSpellbookText != null) PlayerSpellbookText.Foreground = fgBrush;
         }
     }
 
@@ -529,7 +897,7 @@ public partial class MainWindow : Window
 
     private void UpdateNpcList(string key, string value)
     {
-        // Format: NPC[0]: ID, Name, Distance, Health
+        // Format: NPC[0]: ID, Name, Distance, Health[, Category]
         try
         {
             int openBracket = key.IndexOf('[');
@@ -540,13 +908,20 @@ public partial class MainWindow : Window
                 var parts = value.Split(',');
                 if (parts.Length >= 4)
                 {
+                    string category = parts.Length >= 5 ? parts[4].Trim() : "NPC";
                     var npc = new NpcItem
                     {
                         Id = parts[0].Trim(),
                         Name = parts[1].Trim(),
-                        Distance = parts[2].Trim(),
-                        Health = parts[3].Trim()
+                        Distance = parts[2].Trim() + "m",
+                        Health = parts[3].Trim(),
+                        Category = category
                     };
+
+                    if (category == "Slayer Master" && SlayerMasterNearbyText != null)
+                    {
+                        SlayerMasterNearbyText.Text = $"{npc.Name} ({npc.Distance})";
+                    }
 
                     if (index < _npcs.Count)
                         _npcs[index] = npc;
@@ -556,6 +931,529 @@ public partial class MainWindow : Window
             }
         }
         catch { }
+    }
+
+    private void UpdateTreeList(string key, string value)
+    {
+        // Format: TREE[0]: id,name,dist,worldX,worldY,status
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 6)
+                {
+                    var tree = new TreeItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Distance = parts[2].Trim() + "m",
+                        Location = $"({parts[3].Trim()}, {parts[4].Trim()})",
+                        Status = parts[5].Trim()
+                    };
+                    if (index < _trees.Count)
+                        _trees[index] = tree;
+                    else
+                        _trees.Add(tree);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateBankObjList(string key, string value)
+    {
+        // Format: BANK_OBJ[0]: id,name,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 5)
+                {
+                    var item = new SceneObjectItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Distance = parts[2].Trim() + "m",
+                        Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
+                    };
+                    if (index < _banks.Count)
+                        _banks[index] = item;
+                    else
+                        _banks.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateShopObjList(string key, string value)
+    {
+        // Format: SHOP_OBJ[0]: id,name,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 5)
+                {
+                    var item = new SceneObjectItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Distance = parts[2].Trim() + "m",
+                        Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
+                    };
+                    if (index < _shops.Count)
+                        _shops[index] = item;
+                    else
+                        _shops.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateAltarObjList(string key, string value)
+    {
+        // Format: ALTAR_OBJ[0]: id,name,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 5)
+                {
+                    var item = new SceneObjectItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Distance = parts[2].Trim() + "m",
+                        Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
+                    };
+                    if (index < _altars.Count)
+                        _altars[index] = item;
+                    else
+                        _altars.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateRockObjList(string key, string value)
+    {
+        // Format: ROCK_OBJ[0]: id,name,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 5)
+                {
+                    var item = new SceneObjectItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Distance = parts[2].Trim() + "m",
+                        Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
+                    };
+                    if (index < _rocks.Count)
+                        _rocks[index] = item;
+                    else
+                        _rocks.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateGroundItemList(string key, string value)
+    {
+        // Format: GROUND_ITEM[0]: id,name,qty,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 6)
+                {
+                    var item = new GroundItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Quantity = parts[2].Trim(),
+                        Distance = parts[3].Trim() + "m",
+                        Location = $"({parts[4].Trim()}, {parts[5].Trim()})"
+                    };
+                    if (index < _groundItems.Count)
+                        _groundItems[index] = item;
+                    else
+                        _groundItems.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateBankContainerItem(string key, string value)
+    {
+        // Format: BANK_ITEM[0]: id,name,qty
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 3)
+                {
+                    var item = new ContainerItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Quantity = parts[2].Trim()
+                    };
+                    if (index < _bankItems.Count)
+                        _bankItems[index] = item;
+                    else
+                        _bankItems.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateShopContainerItem(string key, string value)
+    {
+        // Format: SHOP_ITEM[0]: id,name,qty
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 3)
+                {
+                    var item = new ContainerItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Quantity = parts[2].Trim()
+                    };
+                    if (index < _shopItems.Count)
+                        _shopItems[index] = item;
+                    else
+                        _shopItems.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateSpecialAttack(string value)
+    {
+        string clean = value.Replace("%", "").Trim();
+        if (double.TryParse(clean, out double pct))
+        {
+            if (SpecProgressBar != null) SpecProgressBar.Value = Math.Clamp(pct, 0, 100);
+            if (SpecPercentText != null) SpecPercentText.Text = $"{pct:0}% Special Attack Energy";
+            if (PlayerSpecText != null) PlayerSpecText.Text = $"{pct:0}%";
+        }
+    }
+
+    private void UpdateSpecialAttackActive(string value)
+    {
+        bool isActive = value.Equals("Active", StringComparison.OrdinalIgnoreCase) || value.Equals("True", StringComparison.OrdinalIgnoreCase);
+        if (SpecActiveBadge != null && SpecActiveText != null)
+        {
+            SpecActiveBadge.Background = isActive ? new SolidColorBrush(Color.FromRgb(30, 60, 45)) : new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            SpecActiveText.Text = isActive ? "Active" : "Inactive";
+            SpecActiveText.Foreground = isActive ? new SolidColorBrush(Color.FromRgb(76, 175, 80)) : Brushes.Gray;
+        }
+    }
+
+    private void UpdateSlayerTask(string value)
+    {
+        if (SlayerTaskText != null) SlayerTaskText.Text = value;
+        if (PlayerSlayerText != null)
+        {
+            string count = SlayerCountText?.Text ?? "0";
+            PlayerSlayerText.Text = value != "None" ? $"{value} ({count})" : "None";
+        }
+    }
+
+    private void UpdateSlayerCount(string value)
+    {
+        if (SlayerCountText != null) SlayerCountText.Text = value;
+        if (PlayerSlayerText != null)
+        {
+            string task = SlayerTaskText?.Text ?? "None";
+            PlayerSlayerText.Text = task != "None" ? $"{task} ({value})" : "None";
+        }
+    }
+
+    private void UpdateBankStatus(string value)
+    {
+        bool isOpen = value.Equals("True", StringComparison.OrdinalIgnoreCase);
+        if (BankOpenBadge != null && BankOpenText != null)
+        {
+            BankOpenBadge.Background = isOpen ? new SolidColorBrush(Color.FromRgb(30, 60, 45)) : new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            BankOpenText.Text = isOpen ? "Bank Open" : "Bank Closed";
+            BankOpenText.Foreground = isOpen ? new SolidColorBrush(Color.FromRgb(76, 175, 80)) : Brushes.Gray;
+        }
+    }
+
+    private void UpdateShopStatus(string value)
+    {
+        bool isOpen = value.Equals("True", StringComparison.OrdinalIgnoreCase);
+        if (ShopOpenBadge != null && ShopOpenText != null)
+        {
+            ShopOpenBadge.Background = isOpen ? new SolidColorBrush(Color.FromRgb(30, 60, 45)) : new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            ShopOpenText.Text = isOpen ? "Store Open" : "Store Closed";
+            ShopOpenText.Foreground = isOpen ? new SolidColorBrush(Color.FromRgb(76, 175, 80)) : Brushes.Gray;
+        }
+    }
+
+    private void UpdateDialogActive(string value)
+    {
+        bool isActive = value.Equals("True", StringComparison.OrdinalIgnoreCase);
+        if (PlayerDialogBadge != null && PlayerDialogBadgeText != null)
+        {
+            PlayerDialogBadge.Background = isActive ? new SolidColorBrush(Color.FromRgb(30, 50, 75)) : new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            PlayerDialogBadgeText.Text = isActive ? "Active" : "Inactive";
+            PlayerDialogBadgeText.Foreground = isActive ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : Brushes.Gray;
+        }
+        if (!isActive)
+        {
+            if (DialogTypeText != null) DialogTypeText.Text = "No Active Dialogue";
+            if (DialogTypeBadge != null) DialogTypeBadge.Background = new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            if (DialogTitleText != null) DialogTitleText.Text = "";
+            if (DialogContentText != null) DialogContentText.Text = "No dialog currently open in the game client.";
+            if (DialogOptionsPanel != null) DialogOptionsPanel.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void UpdateDialogType(string value)
+    {
+        if (DialogTypeText != null) DialogTypeText.Text = $"{value} Dialogue";
+        if (DialogTypeBadge != null)
+        {
+            DialogTypeBadge.Background = new SolidColorBrush(Color.FromRgb(30, 50, 75));
+            if (DialogTypeText != null) DialogTypeText.Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255));
+        }
+    }
+
+    private void UpdateDialogTitle(string value)
+    {
+        if (DialogTitleText != null) DialogTitleText.Text = value;
+    }
+
+    private void UpdateDialogText(string value)
+    {
+        if (DialogContentText != null && !string.IsNullOrWhiteSpace(value))
+        {
+            DialogContentText.Text = value;
+        }
+    }
+
+    private void UpdateDialogOptions(string value)
+    {
+        if (DialogOptionsPanel != null && DialogOptionsText != null)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                var options = value.Split('|');
+                var sb = new System.Text.StringBuilder();
+                for (int i = 0; i < options.Length; i++)
+                {
+                    if (i > 0) sb.AppendLine();
+                    sb.Append($"{i + 1}. {options[i].Trim()}");
+                }
+                DialogOptionsText.Text = sb.ToString();
+                DialogOptionsPanel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                DialogOptionsPanel.Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    private void UpdateShortcutList(string key, string value)
+    {
+        // Format: SHORTCUT[0]: id,name,reqLevel,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 6)
+                {
+                    var item = new ShortcutItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        ReqLevel = "Lvl " + parts[2].Trim(),
+                        Distance = parts[3].Trim() + "m",
+                        Location = $"({parts[4].Trim()}, {parts[5].Trim()})"
+                    };
+                    if (index < _shortcuts.Count)
+                        _shortcuts[index] = item;
+                    else
+                        _shortcuts.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateAgilityObstacleList(string key, string value)
+    {
+        // Format: AGILITY_OBSTACLE[0]: id,name,course,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 6)
+                {
+                    var item = new AgilityObstacleItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Course = parts[2].Trim(),
+                        Distance = parts[3].Trim() + "m",
+                        Location = $"({parts[4].Trim()}, {parts[5].Trim()})"
+                    };
+                    if (index < _agilityObstacles.Count)
+                        _agilityObstacles[index] = item;
+                    else
+                        _agilityObstacles.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateFishingSpotList(string key, string value)
+    {
+        // Format: FISHING_SPOT[0]: id,name,spotType,dist,worldX,worldY
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 6)
+                {
+                    var item = new FishingSpotItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        SpotType = parts[2].Trim(),
+                        Distance = parts[3].Trim() + "m",
+                        Location = $"({parts[4].Trim()}, {parts[5].Trim()})"
+                    };
+                    if (index < _fishingSpots.Count)
+                        _fishingSpots[index] = item;
+                    else
+                        _fishingSpots.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateAgilityCourse(string value)
+    {
+        if (AgilityCourseText != null) AgilityCourseText.Text = value;
+        if (PlayerAgilityText != null)
+        {
+            if (value != "None")
+            {
+                string req = AgilityCourseLevelText?.Text ?? "";
+                PlayerAgilityText.Text = !string.IsNullOrEmpty(req) && req != "-" ? $"{value} ({req})" : value;
+            }
+            else
+            {
+                PlayerAgilityText.Text = "None";
+            }
+        }
+    }
+
+    private void UpdateAgilityCourseLevel(string value)
+    {
+        if (AgilityCourseLevelText != null) AgilityCourseLevelText.Text = value != "-" ? $"Level {value}" : "-";
+        if (PlayerAgilityText != null)
+        {
+            string course = AgilityCourseText?.Text ?? "None";
+            if (course != "None")
+            {
+                PlayerAgilityText.Text = value != "-" ? $"{course} (Lvl {value})" : course;
+            }
+        }
+    }
+
+    private void UpdateMarksOfGrace(string value)
+    {
+        if (MarksOfGraceText != null)
+        {
+            int count = int.TryParse(value, out int c) ? c : 0;
+            MarksOfGraceText.Text = count > 0 ? $"{count} Nearby" : "0 Nearby";
+            MarksOfGraceText.Foreground = count > 0 ? new SolidColorBrush(Color.FromRgb(255, 215, 0)) : Brushes.Gray;
+        }
+    }
+
+    private void UpdateMinigameActive(string value)
+    {
+        bool isActive = value.Equals("True", StringComparison.OrdinalIgnoreCase);
+        if (MinigameActiveBadge != null && MinigameActiveText != null)
+        {
+            MinigameActiveBadge.Background = isActive ? new SolidColorBrush(Color.FromRgb(40, 25, 55)) : new SolidColorBrush(Color.FromRgb(42, 42, 42));
+            MinigameActiveText.Text = isActive ? "Active" : "Inactive";
+            MinigameActiveText.Foreground = isActive ? new SolidColorBrush(Color.FromRgb(186, 104, 200)) : Brushes.Gray;
+        }
+    }
+
+    private void UpdateMinigameName(string value)
+    {
+        if (MinigameNameText != null) MinigameNameText.Text = value;
+        if (PlayerMinigameText != null)
+        {
+            PlayerMinigameText.Text = value;
+            PlayerMinigameText.Foreground = value != "None" ? new SolidColorBrush(Color.FromRgb(186, 104, 200)) : Brushes.Gray;
+        }
     }
 
     private void UpdatePlayerList(string key, string value)
@@ -697,6 +1595,11 @@ public partial class MainWindow : Window
     {
         Dispatcher.Invoke(() =>
         {
+            if ((_isTcpConnected || _isAgentConnected) && 
+                (text.StartsWith("Scanning") || text.StartsWith("Waiting") || text.StartsWith("Detected") || text.StartsWith("Attaching") || text.Contains("blocked attach") || text.Contains("Restart RuneLite")))
+            {
+                return;
+            }
             StatusLabel.Text = text;
             StatusLabel.Foreground = color;
         });
@@ -741,19 +1644,25 @@ public partial class MainWindow : Window
     private void AttachButton_Click(object sender, RoutedEventArgs e)
     {
         _failedPidCooldown.Clear();
-        Task.Run(() => FindAndAttachRuneLite());
+        Task.Run(() => FindAndAttachAnyClient());
     }
 
-    private void FindAndAttachRuneLite()
+    private void FindAndAttachAnyClient()
     {
+        if (_isTcpConnected || _isAgentConnected)
+        {
+            Dispatcher.Invoke(() => UpdateStatus("Already connected to active client.", Brushes.Lime));
+            return;
+        }
+
         try
         {
-            Dispatcher.Invoke(() => UpdateStatus("Scanning for RuneLite / Java...", Brushes.Yellow));
-            
+            Dispatcher.Invoke(() => UpdateStatus("Scanning for RuneLite JVM...", Brushes.Yellow));
+
             var candidates = FindRuneLiteCandidateProcesses();
             if (candidates.Count == 0)
             {
-                Dispatcher.Invoke(() => UpdateStatus("RuneLite not found! Waiting for client...", Brushes.Orange));
+                Dispatcher.Invoke(() => UpdateStatus("No active game client found. Waiting...", Brushes.Orange));
                 return;
             }
 
@@ -764,6 +1673,7 @@ public partial class MainWindow : Window
                 if (TryAttachAgent(pid.ToString()))
                 {
                     _lastAttachedPid = pid.ToString();
+                    TrackRuneLiteProcess(pid);
                     attached = true;
                     Dispatcher.Invoke(() => UpdateStatus($"Attached to PID {pid}. Connecting...", Brushes.Lime));
                     break;
@@ -772,7 +1682,7 @@ public partial class MainWindow : Window
 
             if (!attached)
             {
-                Dispatcher.Invoke(() => UpdateStatus("Attach attempt completed. Waiting for JVM...", Brushes.Red));
+                Dispatcher.Invoke(() => UpdateStatus("Attach attempt completed. Waiting for client...", Brushes.Red));
             }
         }
         catch (Exception ex)
@@ -782,9 +1692,57 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SyncAgentJar()
+    {
+        try
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string sourceAgent = System.IO.Path.Combine(baseDir, "agent.jar");
+            if (!System.IO.File.Exists(sourceAgent))
+                sourceAgent = System.IO.Path.Combine(Environment.CurrentDirectory, "agent.jar");
+            
+            if (!System.IO.File.Exists(sourceAgent)) return;
+
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            string[] targetDirs = {
+                System.IO.Path.Combine(localAppData, "RuneLite"),
+                System.IO.Path.Combine(userProfile, ".runelite"),
+                System.IO.Path.Combine(localAppData, "Jagex Launcher", "games", "RuneLite"),
+                System.IO.Path.Combine(userProfile, ".jagexlauncher", "games", "runelite"),
+                System.IO.Path.Combine(Environment.CurrentDirectory, "bin", "Release", "net9.0-windows"),
+                System.IO.Path.Combine(Environment.CurrentDirectory, "bin", "Debug", "net9.0-windows")
+            };
+
+            foreach (var dir in targetDirs)
+            {
+                try
+                {
+                    if (System.IO.Directory.Exists(dir))
+                    {
+                        string dest = System.IO.Path.Combine(dir, "agent.jar");
+                        if (System.IO.File.Exists(dest))
+                        {
+                            var fi = new System.IO.FileInfo(dest);
+                            if (fi.IsReadOnly) fi.IsReadOnly = false;
+                        }
+                        System.IO.File.Copy(sourceAgent, dest, overwrite: true);
+                    }
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogMessage($"[AGENT_SYNC_ERROR] {ex.Message}");
+        }
+    }
+
     private List<(int Id, string Name, string Title)> FindRuneLiteCandidateProcesses()
     {
-        var list = new List<(int Id, string Name, string Title)>();
+        var list = new List<(int Id, string Name, string Title, int Priority)>();
+        int currentPid = Environment.ProcessId;
         try
         {
             var processes = System.Diagnostics.Process.GetProcesses();
@@ -792,27 +1750,56 @@ public partial class MainWindow : Window
             {
                 try
                 {
+                    if (p.Id == currentPid) continue;
+
                     string name = p.ProcessName.ToLowerInvariant();
-                    string title = p.MainWindowTitle;
+                    // Ignore non-RuneLite tools/IDEs/browsers/launchers
+                    if (name.Contains("jagexlauncher") ||
+                        name.Contains("osrsmr") ||
+                        name.Contains("rider") ||
+                        name.Contains("idea") ||
+                        name.Contains("devenv") ||
+                        name.Contains("code") ||
+                        name.Contains("chrome") ||
+                        name.Contains("firefox") ||
+                        name.Contains("msedge") ||
+                        name.Contains("explorer"))
+                    {
+                        continue;
+                    }
+
+                    string title = p.MainWindowTitle ?? "";
                     string titleLower = title.ToLowerInvariant();
 
-                    bool match = false;
-                    if (name.Contains("runelite") || titleLower.Contains("runelite"))
-                    {
-                        match = true;
-                    }
-                    else if ((name.Contains("java") || name.Contains("javaw")) && (titleLower.Contains("runelite") || titleLower.Contains("old school") || titleLower.Contains("osrs")))
-                    {
-                        match = true;
-                    }
-                    else if (name.Contains("osclient") || titleLower.Contains("old school runescape"))
-                    {
-                        match = true;
-                    }
+                    bool isJvm = name.Equals("java", StringComparison.OrdinalIgnoreCase) || 
+                                 name.Equals("javaw", StringComparison.OrdinalIgnoreCase);
+                    bool isRuneLiteExe = name.Contains("runelite") || titleLower.Contains("runelite");
 
-                    if (match)
+                    if (isJvm)
                     {
-                        list.Add((p.Id, p.ProcessName, title));
+                        int priority = 50;
+                        if (titleLower.Contains("runelite") || titleLower.Contains("old school") || titleLower.Contains("osrs"))
+                        {
+                            priority = 100;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                string? modulePath = p.MainModule?.FileName?.ToLowerInvariant();
+                                if (!string.IsNullOrEmpty(modulePath) && (modulePath.Contains("runelite") || modulePath.Contains(".runelite")))
+                                {
+                                    priority = 90;
+                                }
+                            }
+                            catch { }
+                        }
+                        list.Add((p.Id, p.ProcessName, title, priority));
+                    }
+                    else if (isRuneLiteExe)
+                    {
+                        int priority = 10;
+                        list.Add((p.Id, p.ProcessName, title, priority));
                     }
                 }
                 catch { }
@@ -823,18 +1810,9 @@ public partial class MainWindow : Window
             LogMessage($"[CANDIDATE_SCAN_ERROR] {ex.Message}");
         }
 
-        // If there are processes with active RuneLite / Old School window titles, strictly prioritize those
-        var titled = list.Where(c => !string.IsNullOrWhiteSpace(c.Title) && (c.Title.ToLowerInvariant().Contains("runelite") || c.Title.ToLowerInvariant().Contains("old school"))).ToList();
-        if (titled.Count > 0)
-        {
-            return titled;
-        }
-
         return list
-            .OrderByDescending(c => c.Title.ToLowerInvariant().Contains("runelite"))
-            .ThenByDescending(c => c.Title.ToLowerInvariant().Contains("old school"))
-            .ThenByDescending(c => c.Name.Equals("javaw", StringComparison.OrdinalIgnoreCase) || c.Name.Equals("java", StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(c => c.Name.ToLowerInvariant().Contains("runelite"))
+            .OrderByDescending(c => c.Priority)
+            .Select(c => (c.Id, c.Name, c.Title))
             .ToList();
     }
 
@@ -842,6 +1820,7 @@ public partial class MainWindow : Window
     {
         try
         {
+            SyncAgentJar();
             string appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             string runeLiteExe = System.IO.Path.Combine(appData, @"RuneLite\RuneLite.exe");
             
@@ -878,7 +1857,11 @@ public partial class MainWindow : Window
                 UseShellExecute = true
             };
 
-            System.Diagnostics.Process.Start(psi);
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc != null)
+            {
+                TrackRuneLiteProcess(proc.Id);
+            }
             UpdateStatus("Launching RuneLite with Hook...", Brushes.Cyan);
             LogMessage($"[LAUNCH] Started RuneLite: {runeLiteExe} {psi.Arguments}");
         }
@@ -940,13 +1923,147 @@ public partial class MainWindow : Window
 
     private bool _configChecked = false;
 
-    private void CheckAndFixRuneLiteConfig()
+    private static void EnsureWrapperCompiled(string wrapperExePath)
     {
-        if (_configChecked) return;
         try
         {
-            string appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            string configPath = System.IO.Path.Combine(appData, "RuneLite", "config.json");
+            if (System.IO.File.Exists(wrapperExePath)) return;
+            string csc = @"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe";
+            if (!System.IO.File.Exists(csc))
+                csc = @"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe";
+            if (!System.IO.File.Exists(csc)) return;
+
+            string srcPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "RuneLiteWrapper.cs");
+            if (!System.IO.File.Exists(srcPath))
+                srcPath = System.IO.Path.Combine(Environment.CurrentDirectory, "RuneLiteWrapper.cs");
+
+            if (System.IO.File.Exists(srcPath))
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(csc, $"/target:winexe /out:\"{wrapperExePath}\" /optimize+ \"{srcPath}\"")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    p?.WaitForExit();
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void InstallJagexLauncherHook()
+    {
+        try
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            string[] runeLiteDirs = {
+                System.IO.Path.Combine(localAppData, "RuneLite"),
+                System.IO.Path.Combine(localAppData, "Jagex Launcher", "games", "RuneLite"),
+                System.IO.Path.Combine(userProfile, ".jagexlauncher", "games", "runelite"),
+                System.IO.Path.Combine(programFiles, "RuneLite")
+            };
+
+            string agentSource = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "agent.jar");
+            if (!System.IO.File.Exists(agentSource))
+                agentSource = System.IO.Path.Combine(Environment.CurrentDirectory, "agent.jar");
+
+            string wrapperExe = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "RuneLiteWrapper.exe");
+            if (!System.IO.File.Exists(wrapperExe))
+                wrapperExe = System.IO.Path.Combine(Environment.CurrentDirectory, "RuneLiteWrapper.exe");
+
+            if (!System.IO.File.Exists(wrapperExe))
+            {
+                EnsureWrapperCompiled(wrapperExe);
+            }
+
+            foreach (var dir in runeLiteDirs)
+            {
+                if (!System.IO.Directory.Exists(dir)) continue;
+
+                string targetExe = System.IO.Path.Combine(dir, "RuneLite.exe");
+                string realExe = System.IO.Path.Combine(dir, "RuneLite_real.exe");
+                string targetAgent = System.IO.Path.Combine(dir, "agent.jar");
+
+                // 1. Sync agent.jar into the RuneLite directory
+                if (System.IO.File.Exists(agentSource))
+                {
+                    try
+                    {
+                        if (!System.IO.File.Exists(targetAgent) || 
+                            new System.IO.FileInfo(agentSource).Length != new System.IO.FileInfo(targetAgent).Length)
+                        {
+                            System.IO.File.Copy(agentSource, targetAgent, true);
+                            LogMessage($"[HOOK] Synced agent.jar into {dir}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"[HOOK_WARN] Could not copy agent.jar to {dir}: {ex.Message}");
+                    }
+                }
+
+                // 2. Install wrapper executable
+                if (System.IO.File.Exists(targetExe) && System.IO.File.Exists(wrapperExe))
+                {
+                    try
+                    {
+                        long wrapperLength = new System.IO.FileInfo(wrapperExe).Length;
+                        long targetLength = new System.IO.FileInfo(targetExe).Length;
+
+                        if (!System.IO.File.Exists(realExe))
+                        {
+                            if (targetLength != wrapperLength)
+                            {
+                                System.IO.File.Move(targetExe, realExe);
+                                System.IO.File.Copy(wrapperExe, targetExe, true);
+                                LogMessage($"[HOOK] Installed Jagex Launcher RuneLite proxy wrapper in {dir}");
+                            }
+                        }
+                        else
+                        {
+                            if (targetLength != wrapperLength)
+                            {
+                                System.IO.File.Copy(wrapperExe, targetExe, true);
+                                LogMessage($"[HOOK] Updated Jagex Launcher RuneLite proxy wrapper in {dir}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"[HOOK_WARN] Could not install wrapper in {dir}: {ex.Message}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogMessage($"[HOOK_ERROR] Failed to install Jagex Launcher hook: {ex.Message}");
+        }
+    }
+
+    private void CheckAndFixRuneLiteConfig(bool silent = false)
+    {
+        if (_configChecked && silent) return;
+        try
+        {
+            SyncAgentJar();
+            InstallJagexLauncherHook();
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            string[] configPaths = {
+                System.IO.Path.Combine(localAppData, "RuneLite", "config.json"),
+                System.IO.Path.Combine(localAppData, "Jagex Launcher", "games", "RuneLite", "config.json"),
+                System.IO.Path.Combine(userProfile, ".jagexlauncher", "games", "runelite", "config.json"),
+                System.IO.Path.Combine(programFiles, "RuneLite", "config.json"),
+                System.IO.Path.Combine(userProfile, ".runelite", "config.json")
+            };
             
             // Get absolute path to agent.jar
             string agentPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "agent.jar");
@@ -954,9 +2071,23 @@ public partial class MainWindow : Window
                 agentPath = System.IO.Path.Combine(Environment.CurrentDirectory, "agent.jar");
             
             agentPath = System.IO.Path.GetFullPath(agentPath).Replace("\\", "/");
+            string escapedPath = agentPath.Replace("/", "\\\\");
+            string agentArg = $"-javaagent:{escapedPath}";
+            const string disableAttachArg = "-XX:-DisableAttachMechanism";
 
-            if (System.IO.File.Exists(configPath))
+            bool anyModified = false;
+
+            foreach (var configPath in configPaths)
             {
+                if (!System.IO.File.Exists(configPath)) continue;
+
+                // Ensure file is writable before modifying
+                var fileInfo = new System.IO.FileInfo(configPath);
+                if (fileInfo.IsReadOnly)
+                {
+                    fileInfo.IsReadOnly = false;
+                }
+
                 string content = System.IO.File.ReadAllText(configPath);
                 
                 // 1. Remove all occurrences of blocking flags from the array
@@ -979,9 +2110,6 @@ public partial class MainWindow : Window
                 }
 
                 // 2. Ensure -javaagent is present and unique
-                string escapedPath = agentPath.Replace("/", "\\\\");
-                string agentArg = $"-javaagent:{escapedPath}";
-                
                 if (content.Contains("-javaagent:"))
                 {
                     string oldAgentPattern = @"\s*""-javaagent:[^""]+""\s*,?|\s*,?\s*""-javaagent:[^""]+""\s*";
@@ -1005,7 +2133,7 @@ public partial class MainWindow : Window
                     if (vmArgsMatch.Success)
                     {
                         int insertIndex = vmArgsMatch.Index + vmArgsMatch.Length;
-                        string injection = $"\n      \"{agentArg}\"";
+                        string injection = $"\n      \"{agentArg}\",\n      \"{disableAttachArg}\"";
                         
                         if (!Regex.IsMatch(content.Substring(insertIndex), @"^\s*\]"))
                         {
@@ -1016,19 +2144,73 @@ public partial class MainWindow : Window
                         changed = true;
                     }
                 }
+                else if (!content.Contains(disableAttachArg))
+                {
+                    var vmArgsMatch = Regex.Match(content, "\"vmArgs\"\\s*:\\s*\\[");
+                    if (vmArgsMatch.Success)
+                    {
+                        int insertIndex = vmArgsMatch.Index + vmArgsMatch.Length;
+                        string injection = $"\n      \"{disableAttachArg}\"";
+                        if (!Regex.IsMatch(content.Substring(insertIndex), @"^\s*\]"))
+                        {
+                            injection += ",";
+                        }
+                        content = content.Insert(insertIndex, injection);
+                        changed = true;
+                    }
+                }
 
                 if (changed)
                 {
                     System.IO.File.WriteAllText(configPath, content);
-                    UpdateStatus("Config Repaired & Hooked.", Brushes.Lime);
+                    anyModified = true;
+                    LogMessage($"[CONFIG] Injected agent hook and attach support into {configPath}");
+                }
+
+                // Lock config file so RuneLite / Jagex Launcher cannot overwrite our injected vmArgs
+                try
+                {
+                    fileInfo.Refresh();
+                    fileInfo.IsReadOnly = true;
+                }
+                catch { }
+            }
+
+            try
+            {
+                string toolOptions = $"-XX:-DisableAttachMechanism -javaagent:\"{agentPath.Replace('/', '\\')}\"";
+                Environment.SetEnvironmentVariable("JAVA_TOOL_OPTIONS", toolOptions, EnvironmentVariableTarget.User);
+                Environment.SetEnvironmentVariable("JAVA_TOOL_OPTIONS", toolOptions, EnvironmentVariableTarget.Process);
+                Environment.SetEnvironmentVariable("_JAVA_OPTIONS", toolOptions, EnvironmentVariableTarget.User);
+                Environment.SetEnvironmentVariable("_JAVA_OPTIONS", toolOptions, EnvironmentVariableTarget.Process);
+                
+                // Broadcast environment change to open windows and shells
+                try
+                {
+                    SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, UIntPtr.Zero, "Environment", SMTO_ABORTIFHUNG, 2000, out _);
+                }
+                catch { }
+
+                LogMessage($"[ENV] Configured _JAVA_OPTIONS and JAVA_TOOL_OPTIONS: {toolOptions}");
+            }
+            catch (Exception envEx)
+            {
+                LogMessage($"[ENV_WARN] Could not set environment variables: {envEx.Message}");
+            }
+
+            if (anyModified)
+            {
+                UpdateStatus("Config Repaired & Hooked.", Brushes.Lime);
+                if (!silent)
+                {
                     MessageBox.Show("RuneLite configuration has been optimized.\n\nPlease RESTART RuneLite now.", "Bridge Optimized");
                 }
-                _configChecked = true;
             }
+            _configChecked = true;
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Failed to fix config: {ex.Message}");
+            LogMessage($"[CONFIG_ERROR] Failed to fix config: {ex.Message}");
         }
     }
 
@@ -1090,69 +2272,84 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    if (!_isAgentConnected)
+                    if (_isAgentConnected || _isTcpConnected)
                     {
-                        var candidates = FindRuneLiteCandidateProcesses();
-                        if (candidates.Count > 0)
+                        await Task.Delay(2000);
+                        continue;
+                    }
+
+                    // Scan for RuneLite JVM Candidates
+                    var candidates = FindRuneLiteCandidateProcesses();
+                    if (candidates.Count > 0)
+                    {
+                        foreach (var (pid, name, title) in candidates)
                         {
-                            foreach (var (pid, name, title) in candidates)
+                            if (_isAgentConnected || _isTcpConnected) break;
+
+                            if (_failedPidCooldown.TryGetValue(pid, out var lastFailTime))
                             {
-                                if (_isAgentConnected) break;
-
-                                if (_failedPidCooldown.TryGetValue(pid, out var lastFailTime))
+                                if ((DateTime.UtcNow - lastFailTime).TotalSeconds < 10)
                                 {
-                                    if ((DateTime.UtcNow - lastFailTime).TotalSeconds < 8)
-                                    {
-                                        continue;
-                                    }
-                                }
-
-                                if (_isAgentConnected) break;
-
-                                Dispatcher.Invoke(() =>
-                                {
-                                    if (!_isAgentConnected)
-                                        UpdateStatus($"Detected {name} (PID {pid}). Attaching...", Brushes.Cyan);
-                                });
-
-                                bool success = TryAttachAgent(pid.ToString());
-                                if (success)
-                                {
-                                    _lastAttachedPid = pid.ToString();
-
-                                    // Wait up to 3.5s for agent socket
-                                    for (int i = 0; i < 7 && !_isAgentConnected; i++)
-                                    {
-                                        await Task.Delay(500);
-                                    }
-                                    if (_isAgentConnected) break;
-
-                                    // Give newly attached agent a 12-second grace period before attempting re-attach
-                                    _failedPidCooldown[pid] = DateTime.UtcNow;
-                                }
-                                else
-                                {
-                                    _failedPidCooldown[pid] = DateTime.UtcNow;
+                                    continue;
                                 }
                             }
 
-                            if (!_isAgentConnected)
-                            {
-                                Dispatcher.Invoke(() =>
-                                {
-                                    if (!_isAgentConnected)
-                                        UpdateStatus("Scanning for active RuneLite JVM...", Brushes.Orange);
-                                });
-                            }
-                        }
-                        else
-                        {
+                            if (_isAgentConnected || _isTcpConnected) break;
+
                             Dispatcher.Invoke(() =>
                             {
-                                if (!_isAgentConnected)
-                                    UpdateStatus("Waiting for RuneLite to launch...", Brushes.Yellow);
+                                if (!_isAgentConnected && !_isTcpConnected)
+                                    UpdateStatus($"Detected JVM {name} (PID {pid}). Attaching...", Brushes.Cyan);
                             });
+
+                            bool success = TryAttachAgent(pid.ToString());
+                            if (success)
+                            {
+                                _lastAttachedPid = pid.ToString();
+                                TrackRuneLiteProcess(pid);
+
+                                // Wait up to 3.5s for agent socket
+                                for (int i = 0; i < 7 && !_isAgentConnected && !_isTcpConnected; i++)
+                                {
+                                    await Task.Delay(500);
+                                }
+                                if (_isAgentConnected || _isTcpConnected) break;
+
+                                // Give newly attached agent cooldown period before attempting re-attach
+                                _failedPidCooldown[pid] = DateTime.UtcNow;
+                            }
+                            else
+                            {
+                                _failedPidCooldown[pid] = DateTime.UtcNow;
+                            }
                         }
+
+                        if (!_isAgentConnected && !_isTcpConnected)
+                        {
+                            Dispatcher.Invoke((Action)(() =>
+                            {
+                                if (!_isAgentConnected && !_isTcpConnected)
+                                {
+                                    if (candidates.Count > 0)
+                                    {
+                                        var first = candidates[0];
+                                        UpdateStatus($"RuneLite running (PID {first.Id}) - Restart RuneLite to connect with Bridge", Brushes.Orange);
+                                    }
+                                    else
+                                    {
+                                        UpdateStatus("Scanning for active OSRS clients...", Brushes.Orange);
+                                    }
+                                }
+                            }));
+                        }
+                    }
+                    else
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            if (!_isAgentConnected && !_isTcpConnected)
+                                UpdateStatus("Waiting for OSRS / RuneLite to launch...", Brushes.Yellow);
+                        });
                     }
                 }
                 catch (Exception ex)
@@ -1160,7 +2357,7 @@ public partial class MainWindow : Window
                     LogMessage($"[AUTO_ATTACH_LOOP_ERROR] {ex.Message}");
                 }
 
-                await Task.Delay(1500);
+                await Task.Delay(2000);
             }
         });
     }
@@ -1173,6 +2370,10 @@ public partial class MainWindow : Window
         }
 
         var candidatePaths = new List<string>();
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
         // 1. JetBrains installations
         try
@@ -1191,7 +2392,6 @@ public partial class MainWindow : Window
         // 2. LocalAppData JetBrains
         try
         {
-            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             string riderJbr = System.IO.Path.Combine(localAppData, @"Programs\Rider\jbr\bin\java.exe");
             if (System.IO.File.Exists(riderJbr)) candidatePaths.Add(riderJbr);
         }
@@ -1211,8 +2411,21 @@ public partial class MainWindow : Window
             if (System.IO.File.Exists(j)) candidatePaths.Add(j);
         }
 
-        // 4. Standard JDK paths
-        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        // 4. RuneLite and Jagex Launcher bundled JREs
+        string[] runeLiteJres = {
+            System.IO.Path.Combine(localAppData, @"RuneLite\jre\bin\java.exe"),
+            System.IO.Path.Combine(localAppData, @"Jagex Launcher\games\RuneLite\jre\bin\java.exe"),
+            System.IO.Path.Combine(programFiles, @"RuneLite\jre\bin\java.exe"),
+            System.IO.Path.Combine(programFilesX86, @"RuneLite\jre\bin\java.exe"),
+            System.IO.Path.Combine(userProfile, @".jagexlauncher\games\runelite\jre\bin\java.exe"),
+            System.IO.Path.Combine(userProfile, @".runelite\jre\bin\java.exe")
+        };
+        foreach (var rj in runeLiteJres)
+        {
+            if (System.IO.File.Exists(rj)) candidatePaths.Add(rj);
+        }
+
+        // 5. Standard JDK paths
         string[] jdkRoots = {
             System.IO.Path.Combine(programFiles, "Java"),
             System.IO.Path.Combine(programFiles, "Eclipse Adoptium"),
@@ -1280,6 +2493,7 @@ public partial class MainWindow : Window
 
     private bool TryAttachAgent(string pid)
     {
+        SyncAgentJar();
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
         string agentPath = System.IO.Path.Combine(baseDir, "agent.jar");
         
@@ -1311,6 +2525,8 @@ public partial class MainWindow : Window
                 RedirectStandardError = true,
                 WorkingDirectory = System.IO.Path.GetDirectoryName(agentPath)
             };
+            psi.EnvironmentVariables["JAVA_TOOL_OPTIONS"] = "";
+            psi.EnvironmentVariables["_JAVA_OPTIONS"] = "";
 
             using var process = System.Diagnostics.Process.Start(psi);
             if (process == null)
@@ -1345,11 +2561,1349 @@ public partial class MainWindow : Window
         }
     }
 
+    private void InitializeBotController()
+    {
+        ScriptRunner.Instance.RegisterBot(new AutoWoodcutterBot());
+        ScriptRunner.Instance.RegisterBot(new AutoFisherBot());
+        ScriptRunner.Instance.RegisterBot(new RooftopAgilityBot());
+        ScriptRunner.Instance.RegisterBot(new AutoAlcherBot());
+
+        BotSelectorComboBox.ItemsSource = ScriptRunner.Instance.RegisteredBots.Select(b => $"{b.Name} ({b.Category})").ToList();
+        if (ScriptRunner.Instance.RegisteredBots.Count > 0)
+        {
+            BotSelectorComboBox.SelectedIndex = 0;
+        }
+
+        ScriptRunner.Instance.OnStatusChanged += (status) => Dispatcher.Invoke(() => UpdateBotUiStatus(status));
+        ScriptRunner.Instance.OnLogMessage += (msg) => Dispatcher.Invoke(() => AppendBotConsole(msg));
+        ScriptRunner.Instance.OnTick += () => Dispatcher.Invoke(() =>
+        {
+            BotCyclesText.Text = $"{ScriptRunner.Instance.LoopIterations} cycles";
+            if (ScriptRunner.Instance.ActiveBot != null)
+            {
+                BotTaskText.Text = ScriptRunner.Instance.ActiveBot.StatusText;
+            }
+        });
+
+        _botTimer.Interval = TimeSpan.FromSeconds(1);
+        _botTimer.Tick += (s, e) =>
+        {
+            if (ScriptRunner.Instance.Status == ScriptStatus.Running)
+            {
+                BotRuntimeText.Text = ScriptRunner.Instance.Runtime.ToString(@"hh\:mm\:ss");
+            }
+        };
+        _botTimer.Start();
+    }
+
+    private void BotSelectorComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        int idx = BotSelectorComboBox.SelectedIndex;
+        if (idx >= 0 && idx < ScriptRunner.Instance.RegisteredBots.Count)
+        {
+            var bot = ScriptRunner.Instance.RegisteredBots[idx];
+            BotTaskText.Text = $"Selected: {bot.Name}";
+            AppendBotConsole($"[Manager] Selected '{bot.Name}' v{bot.Version} ({bot.Category}) - {bot.Description}");
+        }
+    }
+
+    private async void StartBotBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = BotSelectorComboBox.SelectedIndex;
+        if (idx >= 0 && idx < ScriptRunner.Instance.RegisteredBots.Count)
+        {
+            var bot = ScriptRunner.Instance.RegisteredBots[idx];
+            await ScriptRunner.Instance.StartAsync(bot);
+        }
+    }
+
+    private void PauseBotBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (ScriptRunner.Instance.Status == ScriptStatus.Running)
+        {
+            ScriptRunner.Instance.Pause();
+        }
+        else if (ScriptRunner.Instance.Status == ScriptStatus.Paused)
+        {
+            ScriptRunner.Instance.Resume();
+        }
+    }
+
+    private async void StopBotBtn_Click(object sender, RoutedEventArgs e)
+    {
+        await ScriptRunner.Instance.StopAsync();
+    }
+
+    private void ClearBotConsole_Click(object sender, RoutedEventArgs e)
+    {
+        BotConsoleTextBox.Text = "";
+    }
+
+    private void UpdateBotUiStatus(ScriptStatus status)
+    {
+        switch (status)
+        {
+            case ScriptStatus.Running:
+                BotStatusBadge.Background = new SolidColorBrush(Color.FromRgb(20, 50, 25));
+                BotStatusText.Text = "RUNNING";
+                BotStatusText.Foreground = new SolidColorBrush(Color.FromRgb(102, 187, 106));
+                StartBotBtn.IsEnabled = false;
+                PauseBotBtn.IsEnabled = true;
+                PauseBotBtn.Content = "Pause";
+                StopBotBtn.IsEnabled = true;
+                break;
+            case ScriptStatus.Paused:
+                BotStatusBadge.Background = new SolidColorBrush(Color.FromRgb(50, 45, 15));
+                BotStatusText.Text = "PAUSED";
+                BotStatusText.Foreground = new SolidColorBrush(Color.FromRgb(255, 202, 40));
+                StartBotBtn.IsEnabled = false;
+                PauseBotBtn.IsEnabled = true;
+                PauseBotBtn.Content = "Resume";
+                StopBotBtn.IsEnabled = true;
+                break;
+            case ScriptStatus.Stopped:
+            default:
+                BotStatusBadge.Background = new SolidColorBrush(Color.FromRgb(58, 42, 42));
+                BotStatusText.Text = "STOPPED";
+                BotStatusText.Foreground = new SolidColorBrush(Color.FromRgb(229, 115, 115));
+                StartBotBtn.IsEnabled = true;
+                PauseBotBtn.IsEnabled = false;
+                PauseBotBtn.Content = "Pause";
+                StopBotBtn.IsEnabled = false;
+                break;
+        }
+    }
+
+    private void AppendBotConsole(string msg)
+    {
+        string time = DateTime.Now.ToString("HH:mm:ss");
+        BotConsoleTextBox.AppendText($"[{time}] {msg}\n");
+        BotConsoleTextBox.ScrollToEnd();
+    }
+
+    private void InitializeScriptCreator()
+    {
+        CreatorStepsListBox.ItemsSource = _creatorSteps;
+        CreatorNearbyNpcsList.ItemsSource = _creatorNearbyNpcs;
+        CreatorLootTableList.ItemsSource = _creatorLootTable;
+        CreatorActiveLootList.ItemsSource = _creatorActiveLootList;
+        ScanCreatorNearbyNpcs();
+        RefreshSavedScriptsList();
+
+        if (_savedCustomScripts.Count > 0)
+        {
+            LoadScriptIntoEditor(_savedCustomScripts[0]);
+        }
+        else
+        {
+            var templates = ScriptTemplates.GetDefaultTemplates();
+            if (templates.Count > 0)
+            {
+                LoadScriptIntoEditor(templates[0]);
+            }
+        }
+    }
+
+    private void RefreshSavedScriptsList(string? selectName = null)
+    {
+        _savedCustomScripts.Clear();
+        var loaded = CustomScriptStorage.LoadAll();
+        _savedCustomScripts.AddRange(loaded);
+
+        SavedScriptsComboBox.ItemsSource = _savedCustomScripts.Select(s => s.Name).ToList();
+
+        if (!string.IsNullOrEmpty(selectName))
+        {
+            int idx = _savedCustomScripts.FindIndex(s => s.Name.Equals(selectName, StringComparison.OrdinalIgnoreCase));
+            if (idx >= 0) SavedScriptsComboBox.SelectedIndex = idx;
+        }
+        else if (_savedCustomScripts.Count > 0)
+        {
+            SavedScriptsComboBox.SelectedIndex = 0;
+        }
+
+        RefreshBotSelectorComboBox();
+    }
+
+    private void RefreshBotSelectorComboBox(string? selectBotName = null)
+    {
+        foreach (var def in _savedCustomScripts)
+        {
+            var existing = ScriptRunner.Instance.RegisteredBots.OfType<CustomScriptBot>().FirstOrDefault(b => b.Definition.Id == def.Id);
+            if (existing != null)
+            {
+                ScriptRunner.Instance.UnregisterBot(existing);
+            }
+            ScriptRunner.Instance.RegisterBot(new CustomScriptBot(def));
+        }
+
+        int prevIdx = BotSelectorComboBox.SelectedIndex;
+        BotSelectorComboBox.ItemsSource = ScriptRunner.Instance.RegisteredBots.Select(b => $"{b.Name} ({b.Category})").ToList();
+
+        if (!string.IsNullOrEmpty(selectBotName))
+        {
+            int foundIdx = ScriptRunner.Instance.RegisteredBots.ToList().FindIndex(b => b.Name.Equals(selectBotName, StringComparison.OrdinalIgnoreCase));
+            if (foundIdx >= 0)
+            {
+                BotSelectorComboBox.SelectedIndex = foundIdx;
+                return;
+            }
+        }
+
+        if (prevIdx >= 0 && prevIdx < ScriptRunner.Instance.RegisteredBots.Count)
+        {
+            BotSelectorComboBox.SelectedIndex = prevIdx;
+        }
+        else if (ScriptRunner.Instance.RegisteredBots.Count > 0)
+        {
+            BotSelectorComboBox.SelectedIndex = 0;
+        }
+    }
+
+    private void LoadScriptIntoEditor(CustomScriptDefinition def)
+    {
+        CreatorScriptNameBox.Text = def.Name;
+        CreatorDescBox.Text = def.Description;
+        CreatorMinDelayBox.Text = def.MinLoopDelayMs.ToString();
+        CreatorMaxDelayBox.Text = def.MaxLoopDelayMs.ToString();
+
+        foreach (ComboBoxItem item in CreatorCategoryComboBox.Items)
+        {
+            if (item.Content?.ToString()?.Equals(def.Category, StringComparison.OrdinalIgnoreCase) == true)
+            {
+                CreatorCategoryComboBox.SelectedItem = item;
+                break;
+            }
+        }
+
+        _creatorSteps.Clear();
+        foreach (var step in def.Steps)
+        {
+            _creatorSteps.Add(step);
+        }
+
+        if (_creatorSteps.Count > 0)
+        {
+            CreatorStepsListBox.SelectedIndex = 0;
+        }
+    }
+
+    private void LoadTemplateBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string? tplName = (CreatorTemplatesComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString();
+        var templates = ScriptTemplates.GetDefaultTemplates();
+        var matched = templates.FirstOrDefault(t => t.Name.Equals(tplName, StringComparison.OrdinalIgnoreCase)) ?? templates.FirstOrDefault();
+
+        if (matched != null)
+        {
+            LoadScriptIntoEditor(matched);
+            AppendBotConsole($"[Script Creator] Loaded template '{matched.Name}' ({matched.Steps.Count} steps)");
+        }
+    }
+
+    private void CreatorStepsListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (CreatorStepsListBox.SelectedItem is CustomActionStep step)
+        {
+            StepTitleBox.Text = step.Title;
+            StepConditionArgBox.Text = step.ConditionArg;
+            StepTargetNameBox.Text = step.TargetName;
+            StepActionVerbBox.Text = step.ActionVerb;
+            StepParam1Box.Text = step.Param1;
+            StepWaitBox.Text = step.WaitAfterMs.ToString();
+
+            int condIdx = (int)step.Condition;
+            if (condIdx >= 0 && condIdx < StepConditionComboBox.Items.Count)
+            {
+                StepConditionComboBox.SelectedIndex = condIdx;
+            }
+
+            int actIdx = (int)step.ActionType;
+            if (actIdx >= 0 && actIdx < StepActionTypeComboBox.Items.Count)
+            {
+                StepActionTypeComboBox.SelectedIndex = actIdx;
+            }
+        }
+    }
+
+    private void StepActionTypeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (StepTargetLabel == null || StepVerbLabel == null || StepParam1Label == null) return;
+
+        int idx = StepActionTypeComboBox.SelectedIndex;
+        if (idx < 0) return;
+
+        var actionType = (CustomActionType)idx;
+        switch (actionType)
+        {
+            case CustomActionType.ChopObject:
+                StepTargetLabel.Text = "Tree Name (e.g. Tree, Oak tree, Willow):";
+                StepVerbLabel.Text = "Action Verb:";
+                if (string.IsNullOrWhiteSpace(StepTargetNameBox.Text) || StepTargetNameBox.Text == "Tree") StepTargetNameBox.Text = "Tree";
+                StepActionVerbBox.Text = "Chop down";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.MineObject:
+                StepTargetLabel.Text = "Rock Name (e.g. Iron rocks, Copper rocks):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Mine";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.ClickObject:
+                StepTargetLabel.Text = "Object Name (e.g. Door, Ladder, Altar):";
+                StepVerbLabel.Text = "Action Verb (e.g. Open, Climb-up, Pray):";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.AttackNpc:
+                StepTargetLabel.Text = "Target NPC Name (e.g. Goblin, Guard):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Attack";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.TalkNpc:
+                StepTargetLabel.Text = "NPC Name (e.g. Banker, Master Farmer):";
+                StepVerbLabel.Text = "Action Verb (Talk-to, Pickpocket, Bank):";
+                StepActionVerbBox.Text = "Talk-to";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.DropItem:
+                StepTargetLabel.Text = "Item Name to Drop (e.g. Logs, Iron ore):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Drop";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.DropAllExcept:
+                StepTargetLabel.Text = "Keep Items (comma separated, e.g. axe,pickaxe):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Drop";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.EatFood:
+                StepTargetLabel.Text = "Food Item Name (e.g. Trout, Lobster, Shark):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Eat";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.CleanHerb:
+                StepTargetLabel.Text = "Grimy Herb Name (e.g. Grimy ranarr weed):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Clean";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.UseItemOnItem:
+                StepTargetLabel.Text = "Primary Item Name (e.g. Knife, Tinderbox):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Use";
+                StepParam1Label.Text = "Target Item Name (e.g. Logs, Oak logs):";
+                break;
+
+            case CustomActionType.LootGroundItem:
+                StepTargetLabel.Text = "Ground Item Name (e.g. Mark of grace, Coins):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Take";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.BankDepositAll:
+                StepTargetLabel.Text = "Target: (Deposit All Inventory)";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Deposit All";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.BankDepositAllExcept:
+                StepTargetLabel.Text = "Keep Items (comma separated, e.g. axe,pot):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Deposit";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.BankWithdrawItem:
+                StepTargetLabel.Text = "Item Name to Withdraw:";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Withdraw";
+                StepParam1Label.Text = "Withdraw Quantity (e.g. 1, 5, All):";
+                break;
+
+            case CustomActionType.CloseBank:
+                StepTargetLabel.Text = "Target: (Close Bank Interface)";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Close";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.CastSpellOnItem:
+                StepTargetLabel.Text = "Spell Name (e.g. High Level Alchemy):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Cast";
+                StepParam1Label.Text = "Target Inventory Item (e.g. Yew longbow):";
+                break;
+
+            case CustomActionType.CastTeleport:
+                StepTargetLabel.Text = "Teleport Name (e.g. Varrock Teleport):";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Cast";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.RunAgilityObstacle:
+                StepTargetLabel.Text = "Obstacle Name (e.g. Wall, Gap, Tightrope):";
+                StepVerbLabel.Text = "Action Verb (Climb, Jump, Cross):";
+                StepActionVerbBox.Text = "Climb";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.ContinueDialog:
+                StepTargetLabel.Text = "Target: (Press Space / Continue Dialog)";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Continue";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.SelectDialogOption:
+                StepTargetLabel.Text = "Target: (Dialog Options)";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Select Option";
+                StepParam1Label.Text = "Option Number (1, 2, 3, 4, 5):";
+                break;
+
+            case CustomActionType.WaitSeconds:
+                StepTargetLabel.Text = "Target: (Pause / Sleep Delay)";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Wait";
+                StepParam1Label.Text = "(Unused):";
+                break;
+
+            case CustomActionType.WaitForIdle:
+                StepTargetLabel.Text = "Target: (Wait Until Player is Idle)";
+                StepVerbLabel.Text = "Action Verb:";
+                StepActionVerbBox.Text = "Wait";
+                StepParam1Label.Text = "(Unused):";
+                break;
+        }
+    }
+
+    private void AddStepBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var step = BuildStepFromForm();
+        _creatorSteps.Add(step);
+        CreatorStepsListBox.SelectedIndex = _creatorSteps.Count - 1;
+        AppendBotConsole($"[Script Creator] Added step: {step.Summary}");
+    }
+
+    private void UpdateStepBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = CreatorStepsListBox.SelectedIndex;
+        if (idx >= 0 && idx < _creatorSteps.Count)
+        {
+            var step = BuildStepFromForm();
+            _creatorSteps[idx] = step;
+            CreatorStepsListBox.SelectedIndex = idx;
+            AppendBotConsole($"[Script Creator] Updated step {idx + 1}: {step.Summary}");
+        }
+        else
+        {
+            MessageBox.Show("Please select a step from the list to update.", "No Step Selected", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    private CustomActionStep BuildStepFromForm()
+    {
+        int condIdx = Math.Max(0, StepConditionComboBox.SelectedIndex);
+        int actIdx = Math.Max(0, StepActionTypeComboBox.SelectedIndex);
+        int.TryParse(StepWaitBox.Text, out int waitMs);
+        if (waitMs <= 0) waitMs = 1000;
+
+        return new CustomActionStep
+        {
+            Title = string.IsNullOrWhiteSpace(StepTitleBox.Text) ? "Action Step" : StepTitleBox.Text.Trim(),
+            Condition = (CustomConditionType)condIdx,
+            ConditionArg = StepConditionArgBox.Text?.Trim() ?? "",
+            ActionType = (CustomActionType)actIdx,
+            TargetName = StepTargetNameBox.Text?.Trim() ?? "",
+            ActionVerb = StepActionVerbBox.Text?.Trim() ?? "Click",
+            Param1 = StepParam1Box.Text?.Trim() ?? "",
+            WaitAfterMs = waitMs
+        };
+    }
+
+    private void DeleteStepBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = CreatorStepsListBox.SelectedIndex;
+        if (idx >= 0 && idx < _creatorSteps.Count)
+        {
+            _creatorSteps.RemoveAt(idx);
+            if (_creatorSteps.Count > 0)
+            {
+                CreatorStepsListBox.SelectedIndex = Math.Min(idx, _creatorSteps.Count - 1);
+            }
+        }
+    }
+
+    private void MoveUpStepBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = CreatorStepsListBox.SelectedIndex;
+        if (idx > 0 && idx < _creatorSteps.Count)
+        {
+            var item = _creatorSteps[idx];
+            _creatorSteps.RemoveAt(idx);
+            _creatorSteps.Insert(idx - 1, item);
+            CreatorStepsListBox.SelectedIndex = idx - 1;
+        }
+    }
+
+    private void MoveDownStepBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = CreatorStepsListBox.SelectedIndex;
+        if (idx >= 0 && idx < _creatorSteps.Count - 1)
+        {
+            var item = _creatorSteps[idx];
+            _creatorSteps.RemoveAt(idx);
+            _creatorSteps.Insert(idx + 1, item);
+            CreatorStepsListBox.SelectedIndex = idx + 1;
+        }
+    }
+
+    private void ClearStepsBtn_Click(object sender, RoutedEventArgs e)
+    {
+        _creatorSteps.Clear();
+    }
+
+    private void SaveScriptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string name = CreatorScriptNameBox.Text?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            MessageBox.Show("Please enter a name for your custom script.", "Script Name Required", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (_creatorSteps.Count == 0)
+        {
+            MessageBox.Show("Please add at least one action step to the script.", "No Steps Added", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        string category = (CreatorCategoryComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Custom";
+        int.TryParse(CreatorMinDelayBox.Text, out int minDelay);
+        int.TryParse(CreatorMaxDelayBox.Text, out int maxDelay);
+        if (minDelay <= 0) minDelay = 600;
+        if (maxDelay <= minDelay) maxDelay = minDelay + 600;
+
+        var def = new CustomScriptDefinition
+        {
+            Name = name,
+            Category = category,
+            Description = CreatorDescBox.Text?.Trim() ?? "",
+            MinLoopDelayMs = minDelay,
+            MaxLoopDelayMs = maxDelay,
+            Steps = _creatorSteps.ToList()
+        };
+
+        bool saved = CustomScriptStorage.Save(def);
+        if (saved)
+        {
+            RefreshSavedScriptsList(def.Name);
+            RefreshBotSelectorComboBox(def.Name);
+
+            AppendBotConsole($"[Script Creator] Saved custom script '{def.Name}' with {def.Steps.Count} steps! Ready to run.");
+            MessageBox.Show($"Script '{def.Name}' was successfully saved and registered in the Script Manager!\n\nYou can now select it in the Bot Controller tab and click 'Start Script'.", "Script Saved Successfully", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        else
+        {
+            MessageBox.Show("Failed to save custom script file.", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private async void TestStepBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (CreatorStepsListBox.SelectedItem is CustomActionStep step)
+        {
+            AppendBotConsole($"[Script Creator] Testing step: {step.Summary}...");
+            var testBot = new CustomScriptBot(new CustomScriptDefinition
+            {
+                Name = "Test Runner",
+                Steps = new List<CustomActionStep> { step }
+            });
+            testBot.OnLog += (msg) => AppendBotConsole(msg);
+
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await testBot.OnLoopAsync(cts.Token);
+                AppendBotConsole($"[Script Creator] Finished test for '{step.Title}'.");
+            }
+            catch (Exception ex)
+            {
+                AppendBotConsole($"[Script Creator] Test error: {ex.Message}");
+            }
+        }
+        else
+        {
+            MessageBox.Show("Please select a step from the list to test.", "No Step Selected", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    private void ExportCSharpBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string name = CreatorScriptNameBox.Text?.Trim() ?? "CustomScript";
+        string category = (CreatorCategoryComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Custom";
+        int.TryParse(CreatorMinDelayBox.Text, out int minDelay);
+        int.TryParse(CreatorMaxDelayBox.Text, out int maxDelay);
+        if (minDelay <= 0) minDelay = 600;
+        if (maxDelay <= minDelay) maxDelay = minDelay + 600;
+
+        var def = new CustomScriptDefinition
+        {
+            Name = name,
+            Category = category,
+            Description = CreatorDescBox.Text?.Trim() ?? "",
+            MinLoopDelayMs = minDelay,
+            MaxLoopDelayMs = maxDelay,
+            Steps = _creatorSteps.ToList()
+        };
+
+        string code = CustomScriptStorage.ExportToCSharp(def);
+
+        var viewerWindow = new Window
+        {
+            Title = $"Generated C# Code - {def.Name}",
+            Width = 650,
+            Height = 500,
+            Background = new SolidColorBrush(Color.FromRgb(30, 30, 30)),
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this
+        };
+
+        var grid = new Grid { Margin = new Thickness(10) };
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var textBox = new TextBox
+        {
+            Text = code,
+            IsReadOnly = true,
+            Background = new SolidColorBrush(Color.FromRgb(24, 24, 24)),
+            Foreground = new SolidColorBrush(Color.FromRgb(169, 183, 198)),
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 11,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
+        };
+        Grid.SetRow(textBox, 0);
+        grid.Children.Add(textBox);
+
+        var copyBtn = new Button
+        {
+            Content = "Copy C# Code to Clipboard",
+            Padding = new Thickness(15, 6, 15, 6),
+            Margin = new Thickness(0, 8, 0, 0),
+            Background = new SolidColorBrush(Color.FromRgb(0, 122, 204)),
+            Foreground = Brushes.White,
+            FontWeight = FontWeights.Bold,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        copyBtn.Click += (s, ev) =>
+        {
+            try
+            {
+                Clipboard.SetText(code);
+                MessageBox.Show("C# source code copied to clipboard!", "Copied", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not copy to clipboard: {ex.Message}", "Clipboard Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        };
+        Grid.SetRow(copyBtn, 1);
+        grid.Children.Add(copyBtn);
+
+        viewerWindow.Content = grid;
+        viewerWindow.ShowDialog();
+    }
+
+    private void SavedScriptsComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        int idx = SavedScriptsComboBox.SelectedIndex;
+        if (idx >= 0 && idx < _savedCustomScripts.Count)
+        {
+            LoadScriptIntoEditor(_savedCustomScripts[idx]);
+        }
+    }
+
+    private void DeleteSavedScriptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = SavedScriptsComboBox.SelectedIndex;
+        if (idx >= 0 && idx < _savedCustomScripts.Count)
+        {
+            var script = _savedCustomScripts[idx];
+            var result = MessageBox.Show($"Are you sure you want to delete custom script '{script.Name}'?", "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (result == MessageBoxResult.Yes)
+            {
+                CustomScriptStorage.Delete(script.Id);
+                var bot = ScriptRunner.Instance.RegisteredBots.OfType<CustomScriptBot>().FirstOrDefault(b => b.Definition.Id == script.Id);
+                if (bot != null) ScriptRunner.Instance.UnregisterBot(bot);
+
+                RefreshSavedScriptsList();
+                AppendBotConsole($"[Script Creator] Deleted custom script '{script.Name}'");
+            }
+        }
+    }
+
+    private void PopoutCurrentScriptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        int idx = BotSelectorComboBox.SelectedIndex;
+        var bots = ScriptRunner.Instance.RegisteredBots.ToList();
+        if (idx >= 0 && idx < bots.Count)
+        {
+            var bot = bots[idx];
+            CustomScriptDefinition def;
+            if (bot is CustomScriptBot csb)
+            {
+                def = csb.Definition;
+            }
+            else
+            {
+                def = new CustomScriptDefinition
+                {
+                    Name = bot.Name,
+                    Category = bot.Category,
+                    Description = bot.Description,
+                    Author = bot.Author,
+                    Version = bot.Version
+                };
+            }
+            var popout = new ScriptPopoutWindow(def) { Owner = this };
+            popout.Show();
+        }
+        else
+        {
+            MessageBox.Show("Please select a script from the dropdown first.", "No Script Selected", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    private void PopoutCreatorScriptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string name = CreatorScriptNameBox.Text?.Trim() ?? "Custom Script";
+        string category = (CreatorCategoryComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Custom";
+        int.TryParse(CreatorMinDelayBox.Text, out int minDelay);
+        int.TryParse(CreatorMaxDelayBox.Text, out int maxDelay);
+        if (minDelay <= 0) minDelay = 600;
+        if (maxDelay <= minDelay) maxDelay = minDelay + 600;
+
+        var def = new CustomScriptDefinition
+        {
+            Name = name,
+            Category = category,
+            Description = CreatorDescBox.Text?.Trim() ?? "",
+            MinLoopDelayMs = minDelay,
+            MaxLoopDelayMs = maxDelay,
+            Steps = _creatorSteps.ToList()
+        };
+
+        var popout = new ScriptPopoutWindow(def) { Owner = this };
+        popout.Show();
+    }
+
+    private void OpenAiAssistantBtn_Click(object sender, RoutedEventArgs e)
+    {
+        AiAssistantPanel.Visibility = Visibility.Visible;
+    }
+
+    private void CloseAiAssistantBtn_Click(object sender, RoutedEventArgs e)
+    {
+        AiAssistantPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private void CopyAiPromptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string prompt = AiScriptAssistant.GetAiPromptTemplate();
+        try
+        {
+            Clipboard.SetText(prompt);
+            MessageBox.Show("AI Prompt Template copied to clipboard!\n\nPaste it into ChatGPT, Claude, or any AI model to generate custom scripts.", "AI Prompt Copied", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not copy: {ex.Message}", "Clipboard Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void PasteAiScriptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (Clipboard.ContainsText())
+            {
+                AiScriptInputBox.Text = Clipboard.GetText();
+            }
+        }
+        catch { }
+    }
+
+    private void UploadAiScriptBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Filter = "Script Files (*.json;*.txt;*.cs)|*.json;*.txt;*.cs|All Files (*.*)|*.*",
+            Title = "Upload AI Script File"
+        };
+        if (dlg.ShowDialog() == true)
+        {
+            try
+            {
+                string text = File.ReadAllText(dlg.FileName);
+                AiScriptInputBox.Text = text;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not read file: {ex.Message}", "File Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+    }
+
+    private void ImportAiScriptAndPopoutBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string raw = AiScriptInputBox.Text?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            MessageBox.Show("Please paste or upload AI script content into the box first.", "No Script Content", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            var def = AiScriptAssistant.ParseAiResponse(raw);
+            if (def == null)
+            {
+                MessageBox.Show("Could not parse AI script. Please make sure the JSON format is valid.", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+            CustomScriptStorage.Save(def);
+            RefreshSavedScriptsList(def.Name);
+            LoadScriptIntoEditor(def);
+            AiAssistantPanel.Visibility = Visibility.Collapsed;
+
+            AppendBotConsole($"[AI Assistant] Imported '{def.Name}' ({def.Steps.Count} steps)");
+
+            var popout = new ScriptPopoutWindow(def) { Owner = this };
+            popout.Show();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not parse AI script:\n{ex.Message}\n\nEnsure the text contains valid JSON from the AI Prompt Template.", "Import Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void CreatorScanNearbyNpcs_Click(object sender, RoutedEventArgs e)
+    {
+        ScanCreatorNearbyNpcs();
+        AppendBotConsole($"[Script Creator] Scanned {_creatorNearbyNpcs.Count} nearby monsters.");
+    }
+
+    private void ScanCreatorNearbyNpcs()
+    {
+        _creatorNearbyNpcs.Clear();
+        foreach (var npc in _npcs)
+        {
+            if (npc != null && !string.IsNullOrWhiteSpace(npc.Name))
+            {
+                _creatorNearbyNpcs.Add(npc);
+            }
+        }
+
+        if (_creatorNearbyNpcs.Count == 0)
+        {
+            _creatorNearbyNpcs.Add(new NpcItem { Name = "Goblin", Distance = "3.5m", Health = "100%", Category = "Combat" });
+            _creatorNearbyNpcs.Add(new NpcItem { Name = "Guard", Distance = "6.1m", Health = "100%", Category = "Combat" });
+            _creatorNearbyNpcs.Add(new NpcItem { Name = "Hill Giant", Distance = "8.9m", Health = "100%", Category = "Combat" });
+        }
+    }
+
+    private void CreatorNearbyNpcsList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (CreatorNearbyNpcsList.SelectedItem is NpcItem npc)
+        {
+            string rawName = npc.Name;
+            int idx = rawName.IndexOf('(');
+            if (idx > 0) rawName = rawName.Substring(0, idx).Trim();
+
+            RefreshCreatorLootTable(rawName);
+            AppendBotConsole($"[Script Creator] Selected target monster: '{rawName}' - loaded loot table.");
+        }
+    }
+
+    private void RefreshCreatorLootTable(string monsterName)
+    {
+        _creatorLootTable.Clear();
+        var drops = OsrsMonsterLootDatabase.GetLootTable(monsterName);
+        foreach (var d in drops)
+        {
+            _creatorLootTable.Add(d);
+        }
+    }
+
+    private void CreatorAddSelectedLoot_Click(object sender, RoutedEventArgs e)
+    {
+        var selected = CreatorLootTableList.SelectedItems.OfType<MonsterLootItem>().ToList();
+        if (selected.Count == 0 && CreatorLootTableList.SelectedItem is MonsterLootItem single)
+            selected.Add(single);
+
+        int added = 0;
+        foreach (var item in selected)
+        {
+            if (!_creatorActiveLootList.Contains(item.ItemName))
+            {
+                _creatorActiveLootList.Add(item.ItemName);
+                added++;
+            }
+        }
+        AppendBotConsole($"[Script Creator] Added {added} item(s) to loot list.");
+    }
+
+    private void CreatorAddHerbsLoot_Click(object sender, RoutedEventArgs e)
+    {
+        int added = 0;
+        foreach (var item in _creatorLootTable.Where(i => i.Category.Contains("Herb", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (!_creatorActiveLootList.Contains(item.ItemName))
+            {
+                _creatorActiveLootList.Add(item.ItemName);
+                added++;
+            }
+        }
+        AppendBotConsole($"[Script Creator] Added {added} herbs to loot list.");
+    }
+
+    private void CreatorAddAlwaysLoot_Click(object sender, RoutedEventArgs e)
+    {
+        int added = 0;
+        foreach (var item in _creatorLootTable.Where(i => i.Rarity.Equals("Always", StringComparison.OrdinalIgnoreCase) || i.Category.Contains("Bones", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (!_creatorActiveLootList.Contains(item.ItemName))
+            {
+                _creatorActiveLootList.Add(item.ItemName);
+                added++;
+            }
+        }
+        AppendBotConsole($"[Script Creator] Added {added} 100% item(s) to loot list.");
+    }
+
+    private void CreatorAddCustomLootItem_Click(object sender, RoutedEventArgs e)
+    {
+        string name = CreatorCustomLootBox.Text?.Trim() ?? "";
+        if (!string.IsNullOrWhiteSpace(name) && !_creatorActiveLootList.Contains(name))
+        {
+            _creatorActiveLootList.Add(name);
+            CreatorCustomLootBox.Text = "";
+            AppendBotConsole($"[Script Creator] Added '{name}' to active loot list.");
+        }
+    }
+
+    private void CreatorRemoveLootItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (CreatorActiveLootList.SelectedItem is string name)
+        {
+            _creatorActiveLootList.Remove(name);
+            AppendBotConsole($"[Script Creator] Removed '{name}' from active loot list.");
+        }
+    }
+
+    private void CreatorApplyCombatLootToSteps_Click(object sender, RoutedEventArgs e)
+    {
+        string monsterName = "Goblin";
+        if (CreatorNearbyNpcsList.SelectedItem is NpcItem selectedNpc && !string.IsNullOrWhiteSpace(selectedNpc.Name))
+        {
+            monsterName = selectedNpc.Name;
+            int parenIdx = monsterName.IndexOf('(');
+            if (parenIdx > 0) monsterName = monsterName.Substring(0, parenIdx).Trim();
+        }
+
+        foreach (ComboBoxItem item in CreatorCategoryComboBox.Items)
+        {
+            if (item.Content?.ToString()?.Equals("Combat", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                CreatorCategoryComboBox.SelectedItem = item;
+                break;
+            }
+        }
+
+        CreatorScriptNameBox.Text = $"Auto Fighter - {monsterName}";
+        CreatorDescBox.Text = $"Fights {monsterName}, eats food, and loots selected items from drop table.";
+
+        _creatorSteps.Clear();
+
+        // 1. Eat food step
+        _creatorSteps.Add(new CustomActionStep
+        {
+            Title = "Eat Food When Low HP",
+            ActionType = CustomActionType.EatFood,
+            Condition = CustomConditionType.HpBelowPercent,
+            ConditionArg = "50",
+            TargetName = "Trout",
+            ActionVerb = "Eat",
+            WaitAfterMs = 600
+        });
+
+        // 2. Loot items from active loot list
+        if (_creatorActiveLootList.Count == 0)
+        {
+            _creatorActiveLootList.Add("Bones");
+            _creatorActiveLootList.Add("Coins");
+        }
+
+        foreach (var loot in _creatorActiveLootList)
+        {
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = $"Loot {loot}",
+                ActionType = CustomActionType.LootGroundItem,
+                Condition = CustomConditionType.InventoryNotFull,
+                TargetName = loot,
+                ActionVerb = "Take",
+                WaitAfterMs = 800
+            });
+        }
+
+        // 3. Attack Monster step
+        _creatorSteps.Add(new CustomActionStep
+        {
+            Title = $"Attack {monsterName}",
+            ActionType = CustomActionType.AttackNpc,
+            Condition = CustomConditionType.PlayerIsIdle,
+            TargetName = monsterName,
+            ActionVerb = "Attack",
+            WaitAfterMs = 2000
+        });
+
+        CreatorStepsListBox.SelectedIndex = 0;
+        AppendBotConsole($"[Script Creator] Generated complete Auto Fighter sequence for '{monsterName}' with {_creatorActiveLootList.Count} loot items!");
+    }
+
+    private void AddQuickBankingStep_Click(object sender, RoutedEventArgs e)
+    {
+        string act = (QuickBankingOptionsComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "Open Nearest Bank";
+        CustomActionStep step;
+
+        if (act.Contains("Open Nearest Bank", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Open Nearest Bank",
+                ActionType = CustomActionType.OpenNearestBank,
+                Condition = CustomConditionType.InventoryFull,
+                TargetName = "Bank booth",
+                ActionVerb = "Bank",
+                WaitAfterMs = 1500
+            };
+        }
+        else if (act.Contains("Deposit All Except", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Deposit All Except Tools",
+                ActionType = CustomActionType.BankDepositAllExcept,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "axe,pickaxe,Trout",
+                ActionVerb = "Deposit",
+                WaitAfterMs = 800
+            };
+        }
+        else if (act.Contains("Deposit Equipment", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Deposit Equipment",
+                ActionType = CustomActionType.BankDepositEquipment,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 600
+            };
+        }
+        else if (act.Contains("Deposit All", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Deposit All Items",
+                ActionType = CustomActionType.BankDepositAll,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 800
+            };
+        }
+        else if (act.Contains("Withdraw ALL", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Withdraw ALL Items",
+                ActionType = CustomActionType.BankWithdrawAll,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "Trout",
+                WaitAfterMs = 800
+            };
+        }
+        else if (act.Contains("Withdraw All-But-1", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Withdraw All-But-1",
+                ActionType = CustomActionType.BankWithdrawAllButOne,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "Trout",
+                WaitAfterMs = 800
+            };
+        }
+        else if (act.Contains("Withdraw Item", StringComparison.OrdinalIgnoreCase))
+        {
+            step = new CustomActionStep
+            {
+                Title = "Withdraw Item",
+                ActionType = CustomActionType.BankWithdrawItem,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "Trout",
+                Param1 = "10",
+                WaitAfterMs = 800
+            };
+        }
+        else
+        {
+            step = new CustomActionStep
+            {
+                Title = "Close Bank Interface",
+                ActionType = CustomActionType.CloseBank,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 500
+            };
+        }
+
+        _creatorSteps.Add(step);
+        CreatorStepsListBox.SelectedIndex = _creatorSteps.Count - 1;
+        AppendBotConsole($"[Script Creator] Added banking step: {step.Summary}");
+    }
+
+    private void InsertBankingRoutineBtn_Click(object sender, RoutedEventArgs e)
+    {
+        string preset = (QuickBankingPresetsComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "";
+
+        if (preset.Contains("Full Bank", StringComparison.OrdinalIgnoreCase))
+        {
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Open Bank When Full",
+                ActionType = CustomActionType.OpenNearestBank,
+                Condition = CustomConditionType.InventoryFull,
+                TargetName = "Bank booth",
+                WaitAfterMs = 1500
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Deposit All Items",
+                ActionType = CustomActionType.BankDepositAll,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 800
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Close Bank Interface",
+                ActionType = CustomActionType.CloseBank,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 500
+            });
+        }
+        else if (preset.Contains("Keep Tools", StringComparison.OrdinalIgnoreCase))
+        {
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Open Bank When Full",
+                ActionType = CustomActionType.OpenNearestBank,
+                Condition = CustomConditionType.InventoryFull,
+                TargetName = "Bank booth",
+                WaitAfterMs = 1500
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Deposit All Except Tools",
+                ActionType = CustomActionType.BankDepositAllExcept,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "axe,pickaxe",
+                WaitAfterMs = 800
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Close Bank Interface",
+                ActionType = CustomActionType.CloseBank,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 500
+            });
+        }
+        else if (preset.Contains("Combat Restock", StringComparison.OrdinalIgnoreCase))
+        {
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Open Bank When Full",
+                ActionType = CustomActionType.OpenNearestBank,
+                Condition = CustomConditionType.InventoryFull,
+                TargetName = "Bank booth",
+                WaitAfterMs = 1500
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Deposit Loot (Except Food/Pots)",
+                ActionType = CustomActionType.BankDepositAllExcept,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "Trout,Lobster,Shark,Prayer potion(4)",
+                WaitAfterMs = 800
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Withdraw Food (10x)",
+                ActionType = CustomActionType.BankWithdrawItem,
+                Condition = CustomConditionType.BankIsOpen,
+                TargetName = "Trout",
+                Param1 = "10",
+                WaitAfterMs = 800
+            });
+            _creatorSteps.Add(new CustomActionStep
+            {
+                Title = "Close Bank Interface",
+                ActionType = CustomActionType.CloseBank,
+                Condition = CustomConditionType.BankIsOpen,
+                WaitAfterMs = 500
+            });
+        }
+
+        CreatorStepsListBox.SelectedIndex = _creatorSteps.Count - 1;
+        AppendBotConsole($"[Script Creator] Inserted '{preset}' routine into steps.");
+    }
+
+    public void TrackRuneLiteProcess(int pid)
+    {
+        try
+        {
+            lock (_processTrackLock)
+            {
+                if (_trackedRuneLiteProcess != null && !_trackedRuneLiteProcess.HasExited && _trackedRuneLiteProcess.Id == pid)
+                    return;
+
+                try
+                {
+                    var proc = System.Diagnostics.Process.GetProcessById(pid);
+                    _trackedRuneLiteProcess = proc;
+                    proc.EnableRaisingEvents = true;
+                    proc.Exited += (s, e) =>
+                    {
+                        LogMessage($"[LIFECYCLE] Monitored game client (PID {pid}) closed.");
+                        Dispatcher.Invoke(() =>
+                        {
+                            UpdateStatus("RuneLite closed. Shutting down bridge...", Brushes.Orange);
+                        });
+
+                        Task.Delay(300).ContinueWith(_ =>
+                        {
+                            Dispatcher.Invoke(() =>
+                            {
+                                try { Application.Current.Shutdown(); } catch { }
+                                try { Environment.Exit(0); } catch { }
+                            });
+                        });
+                    };
+                    LogMessage($"[LIFECYCLE] Tracking RuneLite client lifecycle on PID {pid}.");
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"[LIFECYCLE_TRACK_ERROR] {ex.Message}");
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void CloseRuneLite_Click(object sender, RoutedEventArgs e)
+    {
+        int killed = KillAllRuneLiteInstances();
+        LogMessage($"[CLIENT_CONTROL] Terminated {killed} RuneLite / game instance(s).");
+        UpdateStatus(killed > 0 ? $"Closed {killed} RuneLite instance(s)." : "No running RuneLite instances found.", Brushes.Yellow);
+    }
+
+    public static int KillAllRuneLiteInstances()
+    {
+        int count = 0;
+        int currentPid = Environment.ProcessId;
+        try
+        {
+            var processes = System.Diagnostics.Process.GetProcesses();
+            foreach (var p in processes)
+            {
+                try
+                {
+                    if (p.Id == currentPid) continue;
+                    string name = p.ProcessName.ToLowerInvariant();
+                    string title = p.MainWindowTitle.ToLowerInvariant();
+                    bool match = false;
+
+                    if (name.Contains("runelite") || title.Contains("runelite") || name.Contains("runelitewrapper"))
+                    {
+                        match = true;
+                    }
+                    else if (name.Contains("java") || name.Contains("javaw"))
+                    {
+                        if (title.Contains("runelite") || title.Contains("old school") || title.Contains("osrs"))
+                        {
+                            match = true;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                string? modulePath = p.MainModule?.FileName?.ToLowerInvariant();
+                                if (!string.IsNullOrEmpty(modulePath) && (modulePath.Contains("runelite") || modulePath.Contains(".runelite")))
+                                {
+                                    match = true;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+
+                    if (match)
+                    {
+                        p.Kill(true);
+                        count++;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return count;
+    }
+
+    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        _running = false;
+        try { _botTimer.Stop(); } catch { }
+        try { _ = ScriptRunner.Instance.StopAsync(); } catch { }
+        try { _activeTcpClient?.Close(); } catch { }
+        try { _listener?.Stop(); } catch { }
+    }
+
     protected override void OnClosed(EventArgs e)
     {
         _running = false;
-        _listener?.Stop();
+        try { _botTimer.Stop(); } catch { }
+        try { _ = ScriptRunner.Instance.StopAsync(); } catch { }
+        try { _activeTcpClient?.Close(); } catch { }
+        try { _listener?.Stop(); } catch { }
+        try { Application.Current.Shutdown(); } catch { }
         base.OnClosed(e);
+        try { Environment.Exit(0); } catch { }
     }
 }
 
@@ -1371,6 +3925,67 @@ public class NpcItem
     public string Name { get; set; } = "";
     public string Distance { get; set; } = "";
     public string Health { get; set; } = "";
+    public string Category { get; set; } = "NPC";
+}
+
+public class TreeItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Distance { get; set; } = "";
+    public string Location { get; set; } = "";
+    public string Status { get; set; } = "Available";
+}
+
+public class SceneObjectItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Distance { get; set; } = "";
+    public string Location { get; set; } = "";
+}
+
+public class GroundItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Quantity { get; set; } = "";
+    public string Distance { get; set; } = "";
+    public string Location { get; set; } = "";
+}
+
+public class ContainerItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Quantity { get; set; } = "";
+}
+
+public class ShortcutItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string ReqLevel { get; set; } = "1";
+    public string Distance { get; set; } = "";
+    public string Location { get; set; } = "";
+}
+
+public class AgilityObstacleItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Course { get; set; } = "None";
+    public string Distance { get; set; } = "";
+    public string Location { get; set; } = "";
+}
+
+public class FishingSpotItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string SpotType { get; set; } = "";
+    public string Distance { get; set; } = "";
+    public string Location { get; set; } = "";
 }
 
 public class PlayerItem

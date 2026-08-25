@@ -6,4 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="RuneLiteWrapper.cs" />
+    <None Include="RuneLiteWrapper.cs" />
+  </ItemGroup>
 </Project>

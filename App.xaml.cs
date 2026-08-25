@@ -43,7 +43,25 @@ public partial class App : Application
             ex.SetObserved();
         };
 
+        AppDomain.CurrentDomain.ProcessExit += (s, ex) => {
+            try
+            {
+                Environment.Exit(0);
+            }
+            catch { }
+        };
+
         base.OnStartup(e);
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        try
+        {
+            Environment.Exit(0);
+        }
+        catch { }
+        base.OnExit(e);
     }
 
     private void LogFatalError(string type, Exception? ex)
