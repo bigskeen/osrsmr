@@ -85,6 +85,18 @@ public class BytecodeAgent {
         }
     }
 
+    private static final class ItemInfo {
+        final int id;
+        final String name;
+        final int qty;
+
+        ItemInfo(int id, String name, int qty) {
+            this.id = id;
+            this.name = name;
+            this.qty = qty;
+        }
+    }
+
     private static final List<SceneEntry> treeEntries = new ArrayList<>(64);
     private static final List<SceneEntry> bankEntries = new ArrayList<>(32);
     private static final List<SceneEntry> shopEntries = new ArrayList<>(32);
@@ -643,31 +655,24 @@ public class BytecodeAgent {
     private static void processBankAndShop(Object client, StringBuilder data) {
         if (client == null) return;
         try {
-            // 1. Bank Container (95) & Bank Widgets (12 = Bank, 192 = Deposit Box, 631 = Seed Vault)
+            // 1. Bank Widgets (12 = Bank, 192 = Deposit Box, 631 = Seed Vault, 213 = PIN)
+            Object bankWidget = getWidget(client, 12, 1);
+            if (bankWidget == null) bankWidget = getWidget(client, 12, 0);
+            if (bankWidget == null) bankWidget = getWidget(client, 192, 1);
+            if (bankWidget == null) bankWidget = getWidget(client, 631, 1);
+            if (bankWidget == null) bankWidget = getWidget(client, 213, 0);
+
+            boolean bankWidgetOpen = isWidgetVisible(bankWidget);
+
+            // Bank Container (95)
             Object bankContainer = getItemContainer(client, 95);
-            boolean bankWidgetOpen = false;
-            try {
-                Object bw = getWidget(client, 12, 1);
-                if (bw == null) bw = getWidget(client, 12, 0);
-                if (bw == null) bw = getWidget(client, 192, 1);
-                if (bw == null) bw = getWidget(client, 631, 1);
-                if (bw != null) {
-                    Object isHidden = invokeMethodQuietly(bw, "isHidden");
-                    if (isHidden instanceof Boolean) {
-                        bankWidgetOpen = !((Boolean) isHidden);
-                    } else {
-                        bankWidgetOpen = true;
-                    }
-                }
-            } catch (Throwable ignored) {}
+            List<ItemInfo> bankItemsList = new ArrayList<>();
 
             if (bankContainer != null) {
                 Object itemsObj = invokeMethodQuietly(bankContainer, "getItems");
                 if (itemsObj instanceof Object[]) {
                     Object[] items = (Object[]) itemsObj;
-                    int count = 0;
-                    for (int i = 0; i < items.length; i++) {
-                        Object it = items[i];
+                    for (Object it : items) {
                         if (it == null) continue;
                         int id = -1, qty = 0;
                         Object idObj = invokeMethodQuietly(it, "getId");
@@ -677,47 +682,64 @@ public class BytecodeAgent {
 
                         if (id > 0 && id != 65535) {
                             String name = resolveItemName(id);
-                            data.append("BANK_ITEM[").append(count).append("]: ").append(id).append(",").append(name).append(",").append(Math.max(1, qty)).append("\n");
-                            count++;
+                            bankItemsList.add(new ItemInfo(id, name, Math.max(1, qty)));
                         }
                     }
-                    data.append("BANK_OPEN: True\n");
-                    data.append("IS_BANK_OPEN: True\n");
-                    data.append("BANK_TOTAL_ITEMS: ").append(count).append("\n");
-                } else {
-                    data.append("BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
-                    data.append("IS_BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
-                    data.append("BANK_TOTAL_ITEMS: 0\n");
                 }
-            } else {
-                data.append("BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
-                data.append("IS_BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
-                data.append("BANK_TOTAL_ITEMS: 0\n");
             }
 
-            // 2. Shop Container (3) & Shop Widgets (300 = Shop, 300, 16)
-            Object shopContainer = getItemContainer(client, 3);
-            boolean shopWidgetOpen = false;
-            try {
-                Object sw = getWidget(client, 300, 1);
-                if (sw == null) sw = getWidget(client, 300, 0);
-                if (sw != null) {
-                    Object isHidden = invokeMethodQuietly(sw, "isHidden");
-                    if (isHidden instanceof Boolean) {
-                        shopWidgetOpen = !((Boolean) isHidden);
-                    } else {
-                        shopWidgetOpen = true;
+            // Fallback: scan bank item container widget children if container didn't yield items
+            if (bankItemsList.isEmpty() && bankWidgetOpen) {
+                Object itemContainerWidget = getWidget(client, 12, 13);
+                if (itemContainerWidget == null) itemContainerWidget = getWidget(client, 12, 12);
+                if (itemContainerWidget == null) itemContainerWidget = getWidget(client, 12, 1);
+                if (itemContainerWidget != null) {
+                    Object childrenObj = invokeMethodQuietly(itemContainerWidget, "getDynamicChildren");
+                    if (childrenObj == null) childrenObj = invokeMethodQuietly(itemContainerWidget, "getChildren");
+                    if (childrenObj instanceof Object[]) {
+                        for (Object childWidget : (Object[]) childrenObj) {
+                            if (childWidget == null) continue;
+                            int itemId = -1, itemQty = 0;
+                            Object idObj = invokeMethodQuietly(childWidget, "getItemId");
+                            if (idObj instanceof Integer) itemId = (Integer) idObj;
+                            if (itemId <= 0) {
+                                idObj = invokeMethodQuietly(childWidget, "getId");
+                                if (idObj instanceof Integer) itemId = (Integer) idObj;
+                            }
+                            Object qtyObj = invokeMethodQuietly(childWidget, "getItemQuantity");
+                            if (qtyObj instanceof Integer) itemQty = (Integer) qtyObj;
+
+                            if (itemId > 0 && itemId != 65535) {
+                                String name = resolveItemName(itemId);
+                                bankItemsList.add(new ItemInfo(itemId, name, Math.max(1, itemQty)));
+                            }
+                        }
                     }
                 }
-            } catch (Throwable ignored) {}
+            }
+
+            boolean isBankOpen = bankWidgetOpen || !bankItemsList.isEmpty();
+            data.append("BANK_OPEN: ").append(isBankOpen ? "True" : "False").append("\n");
+            data.append("IS_BANK_OPEN: ").append(isBankOpen ? "True" : "False").append("\n");
+            data.append("BANK_TOTAL_ITEMS: ").append(bankItemsList.size()).append("\n");
+            for (int i = 0; i < bankItemsList.size(); i++) {
+                ItemInfo it = bankItemsList.get(i);
+                data.append("BANK_ITEM[").append(i).append("]: ").append(it.id).append(",").append(it.name).append(",").append(it.qty).append("\n");
+            }
+
+            // 2. Shop Widgets (300 = Shop) & Shop Container (3)
+            Object shopWidget = getWidget(client, 300, 1);
+            if (shopWidget == null) shopWidget = getWidget(client, 300, 0);
+            boolean shopWidgetOpen = isWidgetVisible(shopWidget);
+
+            Object shopContainer = getItemContainer(client, 3);
+            List<ItemInfo> shopItemsList = new ArrayList<>();
 
             if (shopContainer != null) {
                 Object itemsObj = invokeMethodQuietly(shopContainer, "getItems");
                 if (itemsObj instanceof Object[]) {
                     Object[] items = (Object[]) itemsObj;
-                    int count = 0;
-                    for (int i = 0; i < items.length; i++) {
-                        Object it = items[i];
+                    for (Object it : items) {
                         if (it == null) continue;
                         int id = -1, qty = 0;
                         Object idObj = invokeMethodQuietly(it, "getId");
@@ -727,22 +749,47 @@ public class BytecodeAgent {
 
                         if (id > 0 && id != 65535) {
                             String name = resolveItemName(id);
-                            data.append("SHOP_ITEM[").append(count).append("]: ").append(id).append(",").append(name).append(",").append(Math.max(1, qty)).append("\n");
-                            count++;
+                            shopItemsList.add(new ItemInfo(id, name, Math.max(1, qty)));
                         }
                     }
-                    data.append("SHOP_OPEN: True\n");
-                    data.append("IS_SHOP_OPEN: True\n");
-                    data.append("SHOP_TOTAL_ITEMS: ").append(count).append("\n");
-                } else {
-                    data.append("SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
-                    data.append("IS_SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
-                    data.append("SHOP_TOTAL_ITEMS: 0\n");
                 }
-            } else {
-                data.append("SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
-                data.append("IS_SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
-                data.append("SHOP_TOTAL_ITEMS: 0\n");
+            }
+
+            if (shopItemsList.isEmpty() && shopWidgetOpen) {
+                Object itemContainerWidget = getWidget(client, 300, 16);
+                if (itemContainerWidget == null) itemContainerWidget = getWidget(client, 300, 1);
+                if (itemContainerWidget != null) {
+                    Object childrenObj = invokeMethodQuietly(itemContainerWidget, "getDynamicChildren");
+                    if (childrenObj == null) childrenObj = invokeMethodQuietly(itemContainerWidget, "getChildren");
+                    if (childrenObj instanceof Object[]) {
+                        for (Object childWidget : (Object[]) childrenObj) {
+                            if (childWidget == null) continue;
+                            int itemId = -1, itemQty = 0;
+                            Object idObj = invokeMethodQuietly(childWidget, "getItemId");
+                            if (idObj instanceof Integer) itemId = (Integer) idObj;
+                            if (itemId <= 0) {
+                                idObj = invokeMethodQuietly(childWidget, "getId");
+                                if (idObj instanceof Integer) itemId = (Integer) idObj;
+                            }
+                            Object qtyObj = invokeMethodQuietly(childWidget, "getItemQuantity");
+                            if (qtyObj instanceof Integer) itemQty = (Integer) qtyObj;
+
+                            if (itemId > 0 && itemId != 65535) {
+                                String name = resolveItemName(itemId);
+                                shopItemsList.add(new ItemInfo(itemId, name, Math.max(1, itemQty)));
+                            }
+                        }
+                    }
+                }
+            }
+
+            boolean isShopOpen = shopWidgetOpen || !shopItemsList.isEmpty();
+            data.append("SHOP_OPEN: ").append(isShopOpen ? "True" : "False").append("\n");
+            data.append("IS_SHOP_OPEN: ").append(isShopOpen ? "True" : "False").append("\n");
+            data.append("SHOP_TOTAL_ITEMS: ").append(shopItemsList.size()).append("\n");
+            for (int i = 0; i < shopItemsList.size(); i++) {
+                ItemInfo it = shopItemsList.get(i);
+                data.append("SHOP_ITEM[").append(i).append("]: ").append(it.id).append(",").append(it.name).append(",").append(it.qty).append("\n");
             }
         } catch (Throwable ignored) {}
     }
@@ -1014,14 +1061,8 @@ public class BytecodeAgent {
                         boolean isBankerNpc = hasAction(npcComp, "bank", "exchange", "collect");
                         boolean isShopNpc = hasAction(npcComp, "trade", "shop", "buy", "buy-items", "trade-with");
 
-                        int nx = playerX, ny = playerY;
-                        Object wp = invokeMethodQuietly(npc, "getWorldLocation");
-                        if (wp != null) {
-                            Object gx = invokeMethodQuietly(wp, "getX");
-                            Object gy = invokeMethodQuietly(wp, "getY");
-                            if (gx instanceof Integer) nx = (Integer) gx;
-                            if (gy instanceof Integer) ny = (Integer) gy;
-                        }
+                        int[] npcCoords = getActorWorldCoordinates(client, npc, baseX, baseY, playerX, playerY);
+                        int nx = npcCoords[0], ny = npcCoords[1];
                         int dist = Math.max(Math.abs(nx - playerX), Math.abs(ny - playerY));
                         String lowerNpc = (npcName != null) ? npcName.toLowerCase() : "";
 
@@ -1207,13 +1248,21 @@ public class BytecodeAgent {
     private static void processCombatAndEntities(Object client, Object player, String localPlayerName, int playerX, int playerY, int plane, StringBuilder data) {
         if (client == null) return;
         try {
+            int baseX = 0, baseY = 0;
+            try {
+                Object bX = invokeMethodQuietly(client, "getBaseX");
+                if (bX instanceof Integer) baseX = (Integer) bX;
+                Object bY = invokeMethodQuietly(client, "getBaseY");
+                if (bY instanceof Integer) baseY = (Integer) bY;
+            } catch (Throwable ignored) {}
+
             boolean inCombat = false;
             boolean underAttack = false;
             String underAttackBy = "None";
             attackingEnemiesList.clear();
 
             Object directTarget = (player != null) ? invokeMethodQuietly(player, "getInteracting") : null;
-            Object combatTargetActor = directTarget;
+            Object combatTargetActor = null;
             int targetIndex = -1;
 
             // 1. Process NPCs
@@ -1252,14 +1301,8 @@ public class BytecodeAgent {
                     if (hrObj instanceof Integer) hpRatio = (Integer) hrObj;
                     int hpPct = (hpRatio >= 0) ? hpRatio : 100;
 
-                    int nx = playerX, ny = playerY;
-                    Object wp = invokeMethodQuietly(npc, "getWorldLocation");
-                    if (wp != null) {
-                        Object gx = invokeMethodQuietly(wp, "getX");
-                        Object gy = invokeMethodQuietly(wp, "getY");
-                        if (gx instanceof Integer) nx = (Integer) gx;
-                        if (gy instanceof Integer) ny = (Integer) gy;
-                    }
+                    int[] npcCoords = getActorWorldCoordinates(client, npc, baseX, baseY, playerX, playerY);
+                    int nx = npcCoords[0], ny = npcCoords[1];
                     int dist = Math.max(Math.abs(nx - playerX), Math.abs(ny - playerY));
 
                     boolean targetingMe = false;
@@ -1283,9 +1326,11 @@ public class BytecodeAgent {
                     }
 
                     if (directTarget != null && directTarget == npc) {
-                        combatTargetActor = npc;
-                        targetIndex = npcCount;
-                        inCombat = true;
+                        if (cbLevel > 0 || anim != -1 || targetingMe || hpPct < 100) {
+                            combatTargetActor = npc;
+                            targetIndex = npcCount;
+                            inCombat = true;
+                        }
                     }
 
                     // Format: <id>,<name>,<hp%>,<worldX>,<worldY>,<plane>,<dist>,<inCombat>,<anim>,<targetingMe>
@@ -1328,14 +1373,8 @@ public class BytecodeAgent {
                     Object animObj = invokeMethodQuietly(p, "getAnimation");
                     if (animObj instanceof Integer) anim = (Integer) animObj;
 
-                    int px = playerX, py = playerY;
-                    Object wp = invokeMethodQuietly(p, "getWorldLocation");
-                    if (wp != null) {
-                        Object gx = invokeMethodQuietly(wp, "getX");
-                        Object gy = invokeMethodQuietly(wp, "getY");
-                        if (gx instanceof Integer) px = (Integer) gx;
-                        if (gy instanceof Integer) py = (Integer) gy;
-                    }
+                    int[] pCoords = getActorWorldCoordinates(client, p, baseX, baseY, playerX, playerY);
+                    int px = pCoords[0], py = pCoords[1];
                     int dist = Math.max(Math.abs(px - playerX), Math.abs(py - playerY));
 
                     String interacting = "None";
@@ -1407,14 +1446,8 @@ public class BytecodeAgent {
                     tHpStr = hrObj + "%";
                 }
 
-                Object wp = invokeMethodQuietly(combatTargetActor, "getWorldLocation");
-                if (wp != null) {
-                    Object gx = invokeMethodQuietly(wp, "getX");
-                    Object gy = invokeMethodQuietly(wp, "getY");
-                    if (gx instanceof Integer && gy instanceof Integer) {
-                        tDist = Math.max(Math.abs(((Integer) gx) - playerX), Math.abs(((Integer) gy) - playerY));
-                    }
-                }
+                int[] tCoords = getActorWorldCoordinates(client, combatTargetActor, baseX, baseY, playerX, playerY);
+                tDist = Math.max(Math.abs(tCoords[0] - playerX), Math.abs(tCoords[1] - playerY));
 
                 String overhead = extractOverheadPrayer(combatTargetActor);
 
@@ -1575,10 +1608,11 @@ public class BytecodeAgent {
     private static void processDialogue(Object client, StringBuilder data) {
         if (client == null) return;
         try {
-            // Widget 231 (NPC dialogue), 219 (Options), 229 (Player/Messagebox)
-            Object widget = getWidget(client, 231, 6);
-            if (widget != null) {
-                Object textObj = invokeMethodQuietly(widget, "getText");
+            // 1. NPC Dialogue (Widget 231)
+            Object npcDialogWidget = getWidget(client, 231, 6);
+            if (npcDialogWidget == null) npcDialogWidget = getWidget(client, 231, 5);
+            if (isWidgetVisible(npcDialogWidget)) {
+                Object textObj = invokeMethodQuietly(npcDialogWidget, "getText");
                 if (textObj instanceof String) {
                     String text = cleanName((String) textObj);
                     if (!text.isEmpty()) {
@@ -1588,23 +1622,116 @@ public class BytecodeAgent {
                             Object nObj = invokeMethodQuietly(npcTitle, "getText");
                             if (nObj instanceof String) npcName = cleanName((String) nObj);
                         }
+                        data.append("DIALOG_ACTIVE: True\n");
+                        data.append("DIALOG_TYPE: NPC\n");
+                        data.append("DIALOG_TITLE: ").append(npcName).append("\n");
                         data.append("DIALOG_NPC_NAME: ").append(npcName).append("\n");
                         data.append("DIALOG_TEXT: ").append(text).append("\n");
+                        data.append("DIALOG_OPTIONS: None\n");
                         return;
                     }
                 }
             }
 
+            // 2. Player Dialogue (Widget 217)
+            Object playerDialogWidget = getWidget(client, 217, 6);
+            if (playerDialogWidget == null) playerDialogWidget = getWidget(client, 217, 5);
+            if (isWidgetVisible(playerDialogWidget)) {
+                Object textObj = invokeMethodQuietly(playerDialogWidget, "getText");
+                if (textObj instanceof String) {
+                    String text = cleanName((String) textObj);
+                    if (!text.isEmpty()) {
+                        Object playerTitle = getWidget(client, 217, 4);
+                        String pTitle = "Player";
+                        if (playerTitle != null) {
+                            Object nObj = invokeMethodQuietly(playerTitle, "getText");
+                            if (nObj instanceof String) pTitle = cleanName((String) nObj);
+                        }
+                        data.append("DIALOG_ACTIVE: True\n");
+                        data.append("DIALOG_TYPE: Player\n");
+                        data.append("DIALOG_TITLE: ").append(pTitle).append("\n");
+                        data.append("DIALOG_TEXT: ").append(text).append("\n");
+                        data.append("DIALOG_OPTIONS: None\n");
+                        return;
+                    }
+                }
+            }
+
+            // 3. Dialogue Options (Widget 219)
+            Object optionsWidget = getWidget(client, 219, 1);
+            if (isWidgetVisible(optionsWidget)) {
+                Object childrenObj = invokeMethodQuietly(optionsWidget, "getChildren");
+                if (childrenObj == null) childrenObj = invokeMethodQuietly(optionsWidget, "getDynamicChildren");
+                if (childrenObj instanceof Object[]) {
+                    Object[] children = (Object[]) childrenObj;
+                    StringBuilder optionsSb = new StringBuilder();
+                    String title = "Select an Option";
+                    for (int i = 0; i < children.length; i++) {
+                        Object child = children[i];
+                        if (child == null) continue;
+                        Object tObj = invokeMethodQuietly(child, "getText");
+                        if (tObj instanceof String) {
+                            String optText = cleanName((String) tObj);
+                            if (optText.isEmpty() || optText.equalsIgnoreCase("Click here to continue")) continue;
+                            if (i == 0 || (i == 1 && optionsSb.length() == 0)) {
+                                title = optText;
+                            } else {
+                                if (optionsSb.length() > 0) optionsSb.append("|");
+                                optionsSb.append(optText);
+                            }
+                        }
+                    }
+                    if (optionsSb.length() > 0) {
+                        data.append("DIALOG_ACTIVE: True\n");
+                        data.append("DIALOG_TYPE: Options\n");
+                        data.append("DIALOG_TITLE: ").append(title).append("\n");
+                        data.append("DIALOG_TEXT: ").append(title).append("\n");
+                        data.append("DIALOG_OPTIONS: ").append(optionsSb.toString()).append("\n");
+                        return;
+                    }
+                }
+            }
+
+            // 4. Message Box (Widget 229)
             Object msgWidget = getWidget(client, 229, 1);
-            if (msgWidget != null) {
+            if (isWidgetVisible(msgWidget)) {
                 Object textObj = invokeMethodQuietly(msgWidget, "getText");
                 if (textObj instanceof String) {
                     String text = cleanName((String) textObj);
                     if (!text.isEmpty()) {
+                        data.append("DIALOG_ACTIVE: True\n");
+                        data.append("DIALOG_TYPE: Message\n");
+                        data.append("DIALOG_TITLE: Message\n");
                         data.append("DIALOG_TEXT: ").append(text).append("\n");
+                        data.append("DIALOG_OPTIONS: None\n");
+                        return;
                     }
                 }
             }
+
+            // 5. Sprite / Item Message Box (Widget 193)
+            Object spriteMsgWidget = getWidget(client, 193, 2);
+            if (isWidgetVisible(spriteMsgWidget)) {
+                Object textObj = invokeMethodQuietly(spriteMsgWidget, "getText");
+                if (textObj instanceof String) {
+                    String text = cleanName((String) textObj);
+                    if (!text.isEmpty()) {
+                        data.append("DIALOG_ACTIVE: True\n");
+                        data.append("DIALOG_TYPE: Item Message\n");
+                        data.append("DIALOG_TITLE: Message\n");
+                        data.append("DIALOG_TEXT: ").append(text).append("\n");
+                        data.append("DIALOG_OPTIONS: None\n");
+                        return;
+                    }
+                }
+            }
+
+            // No active dialogue
+            data.append("DIALOG_ACTIVE: False\n");
+            data.append("DIALOG_TYPE: None\n");
+            data.append("DIALOG_TITLE: None\n");
+            data.append("DIALOG_TEXT: None\n");
+            data.append("DIALOG_OPTIONS: None\n");
         } catch (Throwable ignored) {}
     }
 
@@ -1696,11 +1823,77 @@ public class BytecodeAgent {
 
     private static Object getWidget(Object client, int group, int child) {
         if (client == null) return null;
+        int packedId = (group << 16) | (child & 0xFFFF);
+        try {
+            Method m = findMethod(client.getClass(), "getWidget", int.class);
+            if (m != null) {
+                Object res = m.invoke(client, packedId);
+                if (res != null) return res;
+            }
+        } catch (Throwable ignored) {}
         try {
             Method m = findMethod(client.getClass(), "getWidget", int.class, int.class);
-            if (m != null) return m.invoke(client, group, child);
+            if (m != null) {
+                Object res = m.invoke(client, group, child);
+                if (res != null) return res;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Method m = findMethod(client.getClass(), "getWidgets");
+            if (m != null) {
+                Object res = m.invoke(client);
+                if (res instanceof Object[][]) {
+                    Object[][] widgets = (Object[][]) res;
+                    if (group >= 0 && group < widgets.length && widgets[group] != null) {
+                        if (child >= 0 && child < widgets[group].length) {
+                            return widgets[group][child];
+                        }
+                    }
+                }
+            }
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    private static boolean isWidgetVisible(Object widget) {
+        if (widget == null) return false;
+        try {
+            Object hidden = invokeMethodQuietly(widget, "isHidden");
+            if (hidden instanceof Boolean && ((Boolean) hidden)) return false;
+            Object selfHidden = invokeMethodQuietly(widget, "isSelfHidden");
+            if (selfHidden instanceof Boolean && ((Boolean) selfHidden)) return false;
+            return true;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static int[] getActorWorldCoordinates(Object client, Object actor, int baseX, int baseY, int fallbackX, int fallbackY) {
+        if (actor == null) return new int[]{fallbackX, fallbackY};
+        try {
+            Object wp = invokeMethodQuietly(actor, "getWorldLocation");
+            if (wp != null) {
+                Object gx = invokeMethodQuietly(wp, "getX");
+                Object gy = invokeMethodQuietly(wp, "getY");
+                if (gx instanceof Integer && gy instanceof Integer && ((Integer) gx) > 0 && ((Integer) gy) > 0) {
+                    return new int[]{(Integer) gx, (Integer) gy};
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Object lp = invokeMethodQuietly(actor, "getLocalLocation");
+            if (lp != null) {
+                Object lx = invokeMethodQuietly(lp, "getX");
+                Object ly = invokeMethodQuietly(lp, "getY");
+                if (lx instanceof Integer && ly instanceof Integer) {
+                    int sceneX = ((Integer) lx) >> 7;
+                    int sceneY = ((Integer) ly) >> 7;
+                    if (baseX > 0 && baseY > 0) {
+                        return new int[]{baseX + sceneX, baseY + sceneY};
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return new int[]{fallbackX, fallbackY};
     }
 
     private static int getVarbitValue(Object client, int varbitId) {
