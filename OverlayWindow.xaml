@@ -1,0 +1,163 @@
+<Window x:Class="osrsmr.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="osrsmr Live Bot Overlay"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        IsHitTestVisible="False"
+        Focusable="False"
+        Width="1000" Height="750">
+    <Canvas x:Name="OverlayCanvas" Background="Transparent" ClipToBounds="True">
+        <!-- Main Telemetry & Script HUD Panel -->
+        <Border x:Name="HudBorder" Canvas.Left="15" Canvas.Top="15" Background="#EE161618" BorderBrush="#00E5FF" BorderThickness="1.5" CornerRadius="8" Padding="14,10">
+            <Border.Effect>
+                <DropShadowEffect Color="#00E5FF" BlurRadius="12" Opacity="0.35" ShadowDepth="1"/>
+            </Border.Effect>
+            <StackPanel Width="310">
+                <!-- 1. Script Header & Category -->
+                <Grid Margin="0,0,0,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <TextBlock x:Name="HudScriptTitle" Text="🤖 osrsmr Bot Engine" Foreground="#00E5FF" FontWeight="Bold" FontSize="14"/>
+                        <TextBlock x:Name="HudScriptCategory" Text="CATEGORY: SKILLING" Foreground="#888888" FontSize="9" FontWeight="SemiBold" Margin="0,1,0,0"/>
+                    </StackPanel>
+                    <Border Grid.Column="1" x:Name="HudStatusBadge" Background="#1E4620" CornerRadius="4" Padding="6,2" VerticalAlignment="Center">
+                        <TextBlock x:Name="HudStatusText" Text="RUNNING" Foreground="#85E89D" FontWeight="Bold" FontSize="10"/>
+                    </Border>
+                </Grid>
+
+                <!-- 2. Health / Issue Diagnostic Banner -->
+                <Border x:Name="HudHealthBanner" Background="#1B3320" BorderBrush="#2EA043" BorderThickness="1" CornerRadius="4" Padding="6,3" Margin="0,0,0,6">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="HudHealthIcon" Text="🟢" FontSize="10" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                        <TextBlock x:Name="HudHealthText" Grid.Column="1" Text="Status: Healthy / Normal" Foreground="#A3E4D7" FontSize="10" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                </Border>
+
+                <!-- 3. Script State & Action Card -->
+                <Border Background="#202024" BorderBrush="#35353A" BorderThickness="1" CornerRadius="5" Padding="8,6" Margin="0,0,0,6">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,2">
+                            <TextBlock Text="🎯 Current Task:" Foreground="#888888" FontSize="10" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="HudRuntimeText" HorizontalAlignment="Right" Text="⏱ 00:00:00" Foreground="#FFD700" FontSize="10" FontWeight="Bold"/>
+                        </Grid>
+                        <TextBlock x:Name="HudTaskText" Text="Mining Iron rocks" Foreground="#FFFFFF" FontWeight="SemiBold" FontSize="11" TextTrimming="CharacterEllipsis"/>
+
+                        <TextBlock Text="⚡ Action:" Foreground="#888888" FontSize="10" FontWeight="SemiBold" Margin="0,4,0,0"/>
+                        <TextBlock x:Name="HudActionText" Text="Interacting with Iron rocks [Tile: 3182, 3424]" Foreground="#FFD54F" FontSize="10" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 4. Player Vitals & Stats Bar -->
+                <Border Background="#202024" BorderBrush="#35353A" BorderThickness="1" CornerRadius="5" Padding="8,6" Margin="0,0,0,6">
+                    <StackPanel>
+                        <!-- HP & Prayer Rows -->
+                        <Grid Margin="0,0,0,3">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="6"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- HP Bar -->
+                            <StackPanel Grid.Column="0">
+                                <Grid>
+                                    <TextBlock Text="❤️ HP" Foreground="#E57373" FontSize="9" FontWeight="Bold"/>
+                                    <TextBlock x:Name="HudHpText" HorizontalAlignment="Right" Text="99 / 99" Foreground="#E57373" FontSize="9" FontWeight="Bold"/>
+                                </Grid>
+                                <ProgressBar x:Name="HudHpBar" Value="100" Maximum="100" Height="6" Background="#331010" Foreground="#EF5350" Margin="0,2,0,0"/>
+                            </StackPanel>
+
+                            <!-- Prayer Bar -->
+                            <StackPanel Grid.Column="2">
+                                <Grid>
+                                    <TextBlock Text="✨ Prayer" Foreground="#4DD0E1" FontSize="9" FontWeight="Bold"/>
+                                    <TextBlock x:Name="HudPrayerText" HorizontalAlignment="Right" Text="99 / 99" Foreground="#4DD0E1" FontSize="9" FontWeight="Bold"/>
+                                </Grid>
+                                <ProgressBar x:Name="HudPrayerBar" Value="100" Maximum="100" Height="6" Background="#0E2B38" Foreground="#00E5FF" Margin="0,2,0,0"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Energy & Spec Rows -->
+                        <Grid Margin="0,2,0,2">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="6"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Run Energy -->
+                            <StackPanel Grid.Column="0">
+                                <Grid>
+                                    <TextBlock Text="⚡ Run" Foreground="#FFD54F" FontSize="9" FontWeight="Bold"/>
+                                    <TextBlock x:Name="HudEnergyText" HorizontalAlignment="Right" Text="100%" Foreground="#FFD54F" FontSize="9" FontWeight="Bold"/>
+                                </Grid>
+                                <ProgressBar x:Name="HudEnergyBar" Value="100" Maximum="100" Height="6" Background="#332A0E" Foreground="#FFCA28" Margin="0,2,0,0"/>
+                            </StackPanel>
+
+                            <!-- Special Attack -->
+                            <StackPanel Grid.Column="2">
+                                <Grid>
+                                    <TextBlock Text="🗡 Spec" Foreground="#81C784" FontSize="9" FontWeight="Bold"/>
+                                    <TextBlock x:Name="HudSpecText" HorizontalAlignment="Right" Text="100%" Foreground="#81C784" FontSize="9" FontWeight="Bold"/>
+                                </Grid>
+                                <ProgressBar x:Name="HudSpecBar" Value="100" Maximum="100" Height="6" Background="#113318" Foreground="#66BB6A" Margin="0,2,0,0"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Coordinates & Combat info -->
+                        <TextBlock x:Name="HudPlayerInfoText" Text="Combat: 126 | Pos: (3088, 3491, 0)" Foreground="#9E9E9E" FontSize="9" Margin="0,3,0,0"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 4.5 Active Buffs & Status Badges -->
+                <WrapPanel x:Name="HudBuffsWrapPanel" Margin="0,0,0,6" Visibility="Collapsed"/>
+
+                <!-- 5. Multi-Skill Live XP Tracker -->
+                <Border Background="#202024" BorderBrush="#35353A" BorderThickness="1" CornerRadius="5" Padding="8,6" Margin="0,0,0,4">
+                    <StackPanel>
+                        <!-- XP Tracker Header -->
+                        <Grid Margin="0,0,0,4">
+                            <TextBlock Text="⭐ LIVE XP &amp; STATS" Foreground="#61AFEF" FontWeight="Bold" FontSize="10"/>
+                            <TextBlock x:Name="HudTotalXpHrText" HorizontalAlignment="Right" Text="+0 XP (0/hr)" Foreground="#98C379" FontWeight="Bold" FontSize="10"/>
+                        </Grid>
+
+                        <!-- Dynamic Skill Rows Container -->
+                        <StackPanel x:Name="HudSkillsContainer">
+                            <!-- Default fallback card if no skill gained XP yet -->
+                            <Border x:Name="HudDefaultSkillCard" Background="#18181B" CornerRadius="4" Padding="6,4">
+                                <StackPanel>
+                                    <Grid>
+                                        <TextBlock x:Name="HudDefaultSkillName" Text="🎯 Active Skill Tracker" Foreground="#E0E0E0" FontWeight="SemiBold" FontSize="10"/>
+                                        <TextBlock x:Name="HudDefaultSkillRate" HorizontalAlignment="Right" Text="Tracking XP..." Foreground="#888888" FontSize="9"/>
+                                    </Grid>
+                                    <ProgressBar x:Name="HudDefaultSkillProgress" Value="0" Maximum="100" Height="6" Background="#2A2A2E" Foreground="#007ACC" Margin="0,3"/>
+                                    <Grid>
+                                        <TextBlock x:Name="HudDefaultSkillRemaining" Text="0 XP to next level" Foreground="#888888" FontSize="8"/>
+                                        <TextBlock x:Name="HudDefaultSkillTtl" HorizontalAlignment="Right" Text="TTL: Calculating..." Foreground="#FFB74D" FontSize="8" FontWeight="SemiBold"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- 6. Footer Info & Engine Tick -->
+                <TextBlock x:Name="HudTpsText" Text="Game Tick: 0 | Engine: Live | FPS: 50" Foreground="#6E7681" FontSize="9" Margin="2,2,0,0"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Dynamic Overlay Drawing Layer for Entity Projection & Bounds -->
+        <Canvas x:Name="RenderLayer" Background="Transparent"/>
+    </Canvas>
+</Window>

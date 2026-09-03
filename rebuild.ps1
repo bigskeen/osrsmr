@@ -1,15 +1,21 @@
 ﻿# 0. Close Old Running Instances
 Write-Host "Closing any existing osrsmr, RuneLite, and Java instances..."
+try { cmd.exe /c "taskkill /F /IM osrsmr.exe 2>nul" } catch { }
 Get-Process | Where-Object { $_.ProcessName -match 'osrsmr|runelite|RuneLiteWrapper|javaw|java' } | ForEach-Object {
     try {
         if ($_.MainWindowTitle -match 'Rider' -or $_.Path -match 'JetBrains') { return }
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     } catch { }
 }
-Start-Sleep -Milliseconds 300
+Start-Sleep -Milliseconds 500
 
 # 1. Build Agent
 $localAppData = $env:LOCALAPPDATA
+$oldJto = $env:JAVA_TOOL_OPTIONS
+$oldJo = $env:_JAVA_OPTIONS
+$env:JAVA_TOOL_OPTIONS = ""
+$env:_JAVA_OPTIONS = ""
+
 $javac = "C:\Program Files\JetBrains\JetBrains Rider 2026.1.2\jbr\bin\javac.exe"
 $jar = "C:\Program Files\JetBrains\JetBrains Rider 2026.1.2\jbr\bin\jar.exe"
 
@@ -59,11 +65,26 @@ Get-ChildItem -Path $outDir -Recurse | Where-Object { -not $_.PSIsContainer } | 
 $zip.Dispose()
 
 cd $rootDir
-try { Copy-Item "agent/agent.jar" "agent.jar" -Force -ErrorAction Stop } catch { Write-Warning "Could not overwrite root agent.jar: $($_.Exception.Message)" }
-try { Copy-Item "agent/agent.jar" "bin/Release/net9.0-windows/agent.jar" -Force -ErrorAction Stop } catch { Write-Warning "Could not overwrite bin/Release agent.jar: $($_.Exception.Message)" }
-try { Copy-Item "agent/agent.jar" "bin/Debug/net9.0-windows/agent.jar" -Force -ErrorAction Stop } catch { Write-Warning "Could not overwrite bin/Debug agent.jar: $($_.Exception.Message)" }
-try { if (Test-Path "$localAppData\RuneLite") { Copy-Item "agent/agent.jar" "$localAppData\RuneLite\agent.jar" -Force -ErrorAction SilentlyContinue } } catch { }
-try { if (Test-Path "$env:USERPROFILE\.runelite") { Copy-Item "agent/agent.jar" "$env:USERPROFILE\.runelite\agent.jar" -Force -ErrorAction SilentlyContinue } } catch { }
+function Safe-Copy($src, $dst) {
+    try {
+        Copy-Item $src $dst -Force -ErrorAction Stop
+    } catch {
+        try {
+            $tmp = "$dst.old_" + [System.Guid]::NewGuid().ToString("N")
+            Move-Item $dst $tmp -Force -ErrorAction SilentlyContinue
+            Copy-Item $src $dst -Force -ErrorAction SilentlyContinue
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warning "Could not overwrite ${dst}: $($_.Exception.Message)"
+        }
+    }
+}
+
+Safe-Copy "agent/agent.jar" "agent.jar"
+Safe-Copy "agent/agent.jar" "bin/Release/net9.0-windows/agent.jar"
+Safe-Copy "agent/agent.jar" "bin/Debug/net9.0-windows/agent.jar"
+if (Test-Path "$localAppData\RuneLite") { Safe-Copy "agent/agent.jar" "$localAppData\RuneLite\agent.jar" }
+if (Test-Path "$env:USERPROFILE\.runelite") { Safe-Copy "agent/agent.jar" "$env:USERPROFILE\.runelite\agent.jar" }
 
 # 3. Build Wrapper
 Write-Host "Building RuneLite Jagex Proxy Wrapper..."
@@ -76,6 +97,17 @@ if (Test-Path "$PSScriptRoot\RuneLiteWrapper.cs") {
 
 # 4. Build Bridge
 Write-Host "Building C# Bridge..."
+foreach ($target in @("bin/Release/net9.0-windows/osrsmr.dll", "bin/Release/net9.0-windows/osrsmr.exe", "bin/Release/net9.0-windows/osrsmr.pdb", "bin/Debug/net9.0-windows/osrsmr.dll", "bin/Debug/net9.0-windows/osrsmr.exe", "bin/Debug/net9.0-windows/osrsmr.pdb")) {
+    if (Test-Path $target) {
+        try {
+            $stream = [System.IO.File]::Open($target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $stream.Close()
+        } catch {
+            $tmp = "$target.old_" + [System.Guid]::NewGuid().ToString("N")
+            Rename-Item -Path $target -NewName (Split-Path $tmp -Leaf) -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 dotnet build osrsmr.csproj -c Release
 
 # 5. Update Shortcut

@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -13,12 +14,15 @@ using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using OsrsMr.Core;
+using OsrsMr.Core.Profiles;
+using OsrsMr.Core.Data;
 using OsrsMr.Api;
 using OsrsMr.Api.Entities;
 using OsrsMr.Api.Framework;
 using OsrsMr.Api.CustomScripts;
 using OsrsMr.Scripts;
 using OsrsMr;
+using ScriptStatus = OsrsMr.Api.Framework.ScriptStatus;
 
 namespace osrsmr;
 
@@ -26,6 +30,8 @@ public partial class MainWindow : Window
 {
     private readonly ObservableCollection<DataItem> _dataItems = new();
     private readonly ObservableCollection<DataItem> _skills = new();
+    private readonly ObservableCollection<SkillProgressItem> _displayedSkills = new();
+    private string _currentSkillFilter = "All";
     private readonly ObservableCollection<NpcItem> _npcs = new();
     private readonly ObservableCollection<PlayerItem> _players = new();
     private readonly ObservableCollection<PrayerViewModel> _prayers = new();
@@ -37,6 +43,9 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<GroundItem> _groundItems = new();
     private readonly ObservableCollection<ContainerItem> _bankItems = new();
     private readonly ObservableCollection<ContainerItem> _shopItems = new();
+    private readonly ObservableCollection<GrandExchangeOfferUiItem> _geOffers = new();
+    private readonly ObservableCollection<RunePouchSlotUiItem> _runePouchSlots = new();
+    private readonly ObservableCollection<ContainerItem> _lootingBagItems = new();
     private readonly ObservableCollection<ShortcutItem> _shortcuts = new();
     private readonly ObservableCollection<AgilityObstacleItem> _agilityObstacles = new();
     private readonly ObservableCollection<FishingSpotItem> _fishingSpots = new();
@@ -47,6 +56,20 @@ public partial class MainWindow : Window
     private readonly List<CustomScriptDefinition> _savedCustomScripts = new();
     private readonly Dictionary<string, PrayerViewModel> _prayerMap = new(StringComparer.OrdinalIgnoreCase);
     private readonly Border[] _inventorySlots = new Border[28];
+    private class InventorySlotHolder
+    {
+        public Border Border { get; set; } = null!;
+        public TextBlock NameText { get; set; } = null!;
+        public TextBlock QtyText { get; set; } = null!;
+        public TextBlock SlotNumText { get; set; } = null!;
+        public string LastRaw { get; set; } = "";
+    }
+    private readonly InventorySlotHolder[] _inventorySlotHolders = new InventorySlotHolder[28];
+    private readonly Dictionary<string, string> _lastEquipmentRaw = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SolidColorBrush SlotEmptyBg = new SolidColorBrush(Color.FromArgb(50, 30, 34, 42));
+    private static readonly SolidColorBrush SlotEmptyBorder = new SolidColorBrush(Color.FromRgb(50, 55, 65));
+    private static readonly SolidColorBrush SlotOccupiedBg = new SolidColorBrush(Color.FromRgb(24, 48, 76));
+    private static readonly SolidColorBrush SlotOccupiedBorder = new SolidColorBrush(Color.FromRgb(0, 180, 216));
     private readonly Dictionary<string, Border> _equipmentSlots = new();
     private readonly DispatcherTimer _botTimer = new();
     private TcpListener? _listener;
@@ -61,6 +84,28 @@ public partial class MainWindow : Window
     private string? _cachedJavaPath = null;
     private System.Diagnostics.Process? _trackedRuneLiteProcess = null;
     private readonly object _processTrackLock = new();
+
+    private string _currentLocationName = "Unknown";
+    private int _currentX = 0;
+    private int _currentY = 0;
+    private int _currentPlane = 0;
+    private int _currentRegionId = 0;
+
+    private void UpdatePlayerLocationDisplay()
+    {
+        if (_currentX > 0 && _currentY > 0)
+        {
+            if (string.IsNullOrEmpty(_currentLocationName) || _currentLocationName == "Unknown" || _currentLocationName.StartsWith("Region #") || _currentLocationName == "Gielinor")
+            {
+                _currentLocationName = OsrsMr.Core.Spatial.WorldLocations.ResolveAreaName(_currentX, _currentY, _currentPlane, _currentRegionId);
+            }
+            PlayerLocationText.Text = $"{_currentLocationName} ({_currentX}, {_currentY})";
+        }
+        else if (!string.IsNullOrEmpty(_currentLocationName) && _currentLocationName != "Unknown")
+        {
+            PlayerLocationText.Text = _currentLocationName;
+        }
+    }
 
     [DllImport("kernel32.dll")]
     public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
@@ -86,7 +131,8 @@ public partial class MainWindow : Window
         {
             InitializeComponent();
             DataList.ItemsSource = _dataItems;
-            SkillsControl.ItemsSource = _skills;
+            SkillsControl.ItemsSource = _displayedSkills;
+            RefreshSkillsDisplay();
             NpcList.ItemsSource = _npcs;
             PlayerList.ItemsSource = _players;
             TreesList.ItemsSource = _trees;
@@ -97,6 +143,19 @@ public partial class MainWindow : Window
             GroundItemsList.ItemsSource = _groundItems;
             BankContainerList.ItemsSource = _bankItems;
             ShopContainerList.ItemsSource = _shopItems;
+            GeOffersControl.ItemsSource = _geOffers;
+            for (int i = 0; i < 8; i++)
+            {
+                _geOffers.Add(new GrandExchangeOfferUiItem { Slot = i, State = "Empty" });
+            }
+
+            RunePouchControl.ItemsSource = _runePouchSlots;
+            for (int i = 0; i < 4; i++)
+            {
+                _runePouchSlots.Add(new RunePouchSlotUiItem { Slot = i, RuneName = "None", Quantity = 0 });
+            }
+
+            LootingBagContainerList.ItemsSource = _lootingBagItems;
             ShortcutsList.ItemsSource = _shortcuts;
             WorldShortcutsList.ItemsSource = _shortcuts;
             AgilityObstaclesList.ItemsSource = _agilityObstacles;
@@ -138,6 +197,11 @@ public partial class MainWindow : Window
         _equipmentSlots["10"] = Equip_Feet;
         _equipmentSlots["12"] = Equip_Ring;
         _equipmentSlots["13"] = Equip_Ammo;
+
+        foreach (var kvp in _equipmentSlots)
+        {
+            ResetEquipmentSlotUi(kvp.Key, kvp.Value);
+        }
     }
 
     private void InitializePrayers()
@@ -163,17 +227,19 @@ public partial class MainWindow : Window
 
     private void InitializeInventoryGrid()
     {
+        InventoryGrid.Children.Clear();
         for (int i = 0; i < 28; i++)
         {
             var border = new Border
             {
-                BorderBrush = Brushes.DimGray,
+                BorderBrush = new SolidColorBrush(Color.FromRgb(50, 55, 65)),
                 BorderThickness = new Thickness(1),
-                Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128)),
+                CornerRadius = new CornerRadius(4),
+                Background = new SolidColorBrush(Color.FromArgb(50, 30, 34, 42)),
                 Margin = new Thickness(2),
-                Width = 36,
-                Height = 36,
-                ToolTip = $"Slot {i + 1}"
+                Width = 44,
+                Height = 44,
+                ToolTip = $"Slot {i + 1}: Empty"
             };
 
             int row = i / 4;
@@ -220,7 +286,7 @@ public partial class MainWindow : Window
         _isTcpConnected = true;
         _isAgentConnected = true;
 
-        Dispatcher.BeginInvoke(() => UpdateStatus("Agent Connected & Linked!", Brushes.Lime));
+        _ = Dispatcher.BeginInvoke(() => UpdateStatus("Agent Connected & Linked!", Brushes.Lime));
         LogMessage($"[BRIDGE] Agent client #{sessionId} connected to TCP port 43594.");
 
         // Track candidate RuneLite process if not already tracked
@@ -238,7 +304,7 @@ public partial class MainWindow : Window
         catch { }
         
         // Update diagnostic info
-        Dispatcher.BeginInvoke(() => {
+        _ = Dispatcher.BeginInvoke(() => {
             var existing = _dataItems.FirstOrDefault(i => i.Key == "Agent Link");
             string val = $"Connected (#{sessionId}) at {DateTime.Now.ToLongTimeString()}";
             if (existing != null) existing.Value = val;
@@ -283,19 +349,44 @@ public partial class MainWindow : Window
                 _isTcpConnected = false;
                 _isAgentConnected = false;
                 LogMessage($"[BRIDGE] Agent client #{sessionId} disconnected.");
-                Dispatcher.BeginInvoke(() => UpdateStatus("Agent Disconnected - Waiting for Client...", Brushes.Yellow));
+                _ = Dispatcher.BeginInvoke(() => UpdateStatus("Agent Disconnected - Waiting for Client...", Brushes.Yellow));
             }
         }
     }
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _incomingLines = new();
+    private int _isDispatcherScheduled = 0;
 
     private void ProcessLine(string line)
     {
         try { BrainEngine.Instance.ProcessLine(line); } catch { }
 
-        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, (Action)(() =>
+        _incomingLines.Enqueue(line);
+        if (System.Threading.Interlocked.CompareExchange(ref _isDispatcherScheduled, 1, 0) == 0)
         {
-            try
-            {
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Normal, (Action)DrainIncomingLines);
+        }
+    }
+
+    private void DrainIncomingLines()
+    {
+        System.Threading.Interlocked.Exchange(ref _isDispatcherScheduled, 0);
+        int count = 0;
+        while (count < 800 && _incomingLines.TryDequeue(out var line))
+        {
+            ProcessLineOnUi(line);
+            count++;
+        }
+        if (!_incomingLines.IsEmpty && System.Threading.Interlocked.CompareExchange(ref _isDispatcherScheduled, 1, 0) == 0)
+        {
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Normal, (Action)DrainIncomingLines);
+        }
+    }
+
+    private void ProcessLineOnUi(string line)
+    {
+        try
+        {
             if (line.Contains(":"))
             {
                 var parts = line.Split(':', 2);
@@ -341,6 +432,26 @@ public partial class MainWindow : Window
                 else if (key.StartsWith("SKILL["))
                 {
                     UpdateSkill(key, value);
+                }
+                else if (key.StartsWith("SKILL_XP["))
+                {
+                    UpdateSkillXp(key, value);
+                }
+                else if (key == "TOTAL_LEVEL")
+                {
+                    if (int.TryParse(value, out int totLvl))
+                    {
+                        SkillTrackerEngine.Instance.TotalLevel = totLvl;
+                        RefreshSkillsDisplay();
+                    }
+                }
+                else if (key == "TOTAL_XP")
+                {
+                    if (long.TryParse(value, out long totXp))
+                    {
+                        SkillTrackerEngine.Instance.TotalXp = totXp;
+                        RefreshSkillsDisplay();
+                    }
                 }
                 else if (key == "PID")
                 {
@@ -422,9 +533,69 @@ public partial class MainWindow : Window
                 {
                     PlayerNameText.Text = value;
                 }
-                else if (key == "LOCATION")
+                else if (key == "HITPOINTS" || key == "HP" || key == "PLAYER_HP" || key == "HEALTH")
                 {
-                    PlayerLocationText.Text = value;
+                    UpdatePlayerHitpoints(value);
+                }
+                else if (key == "PRAYER" || key == "PLAYER_PRAYER")
+                {
+                    UpdatePlayerPrayer(value);
+                }
+                else if (key == "RUN_ENERGY" || key == "ENERGY" || key == "PLAYER_ENERGY")
+                {
+                    UpdatePlayerRunEnergy(value);
+                }
+                else if (key == "WEIGHT" || key == "PLAYER_WEIGHT")
+                {
+                    UpdatePlayerWeight(value);
+                }
+                else if (key == "IN_COMBAT" || key == "IS_IN_COMBAT" || key == "PLAYER_IN_COMBAT")
+                {
+                    UpdateCombatStatus(value);
+                }
+                else if (key == "COMBAT_TARGET" || key == "TARGET_NAME" || key == "TARGET")
+                {
+                    UpdateCombatTarget(value);
+                }
+                else if (key == "COMBAT_TARGET_HP" || key == "TARGET_HP")
+                {
+                    UpdateCombatTargetHealth(value);
+                }
+                else if (key == "ANIMATION" || key == "PLAYER_ANIMATION")
+                {
+                    UpdatePlayerAnimation(value);
+                }
+                else if (key == "SLAYER_MASTER")
+                {
+                    if (SlayerMasterText != null) SlayerMasterText.Text = value;
+                }
+                else if (key == "SLAYER_REMAINING")
+                {
+                    if (SlayerRemainingText != null) SlayerRemainingText.Text = value;
+                }
+                else if (key == "LOCATION" || key == "LOCATION_NAME" || key == "TOWN")
+                {
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        _currentLocationName = value;
+                        UpdatePlayerLocationDisplay();
+                    }
+                }
+                else if (key == "REGION_ID")
+                {
+                    if (int.TryParse(value, out int rId))
+                    {
+                        _currentRegionId = rId;
+                        UpdatePlayerLocationDisplay();
+                    }
+                }
+                else if (key == "PLAYER_PLANE" || key == "PLANE")
+                {
+                    if (int.TryParse(value, out int plane))
+                    {
+                        _currentPlane = plane;
+                        UpdatePlayerLocationDisplay();
+                    }
                 }
                 else if (key == "PLAYER_X" || key == "PLAYER_Y")
                 {
@@ -434,11 +605,23 @@ public partial class MainWindow : Window
                     else
                         _dataItems.Add(new DataItem { Key = key, Value = value });
                         
-                    var px = _dataItems.FirstOrDefault(i => i.Key == "PLAYER_X")?.Value;
-                    var py = _dataItems.FirstOrDefault(i => i.Key == "PLAYER_Y")?.Value;
-                    if (px != null && py != null)
+                    if (key == "PLAYER_X" && int.TryParse(value, out int px)) _currentX = px;
+                    if (key == "PLAYER_Y" && int.TryParse(value, out int py)) _currentY = py;
+
+                    UpdatePlayerLocationDisplay();
+                }
+                else if (key == "WORLD_LOCATION")
+                {
+                    var locParts = value.Split(',');
+                    if (locParts.Length >= 2 && int.TryParse(locParts[0].Trim(), out int wx) && int.TryParse(locParts[1].Trim(), out int wy))
                     {
-                        PlayerLocationText.Text = $"({px}, {py})";
+                        _currentX = wx;
+                        _currentY = wy;
+                        if (locParts.Length >= 3 && int.TryParse(locParts[2].Trim(), out int wp))
+                        {
+                            _currentPlane = wp;
+                        }
+                        UpdatePlayerLocationDisplay();
                     }
                 }
                 else if (key == "CURRENT_TAB")
@@ -485,6 +668,19 @@ public partial class MainWindow : Window
                 else if (key == "ACTIVE_PRAYERS")
                 {
                     ActivePrayersListText.Text = value;
+                    if (value.Equals("None", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(value))
+                    {
+                        foreach (var p in _prayers) p.IsActive = false;
+                    }
+                    else
+                    {
+                        var activeSet = new HashSet<string>(value.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries).Select(s => s.Trim().Replace(" ", "").Replace("_", "").ToLowerInvariant()), StringComparer.OrdinalIgnoreCase);
+                        foreach (var p in _prayers)
+                        {
+                            string norm = p.Name.Replace(" ", "").Replace("_", "").ToLowerInvariant();
+                            p.IsActive = activeSet.Contains(norm);
+                        }
+                    }
                 }
                 else if (key == "ACTIVE_PRAYER_COUNT")
                 {
@@ -599,7 +795,7 @@ public partial class MainWindow : Window
                 {
                     if (ShopTitleText != null) ShopTitleText.Text = value;
                 }
-                else if (key == "SHOP_TOTAL_ITEMS")
+                else if (key.StartsWith("SHOP_TOTAL_ITEMS"))
                 {
                     if (ShopItemCountText != null) ShopItemCountText.Text = $"{value} Items In Stock";
                     if (int.TryParse(value, out int totalShopItems))
@@ -608,6 +804,26 @@ public partial class MainWindow : Window
                             _shopItems.RemoveAt(_shopItems.Count - 1);
                     }
                 }
+                else if (key.StartsWith("GE_SLOT["))
+                {
+                    UpdateGrandExchangeOffer(key, value);
+                }
+                else if (key.StartsWith("RUNE_POUCH["))
+                {
+                    UpdateRunePouchSlot(key, value);
+                }
+                else if (key.StartsWith("LOOTING_BAG["))
+                {
+                    UpdateLootingBagItem(key, value);
+                }
+                else if (key == "GEM_BAG")
+                {
+                    UpdateGemBagUi(value);
+                }
+                else if (key == "ESSENCE_POUCHES")
+                {
+                    UpdateEssencePouchesUi(value);
+                }
                 else if (key == "SPECIAL_ATTACK_PERCENT" || key == "SPECIAL_ATTACK_ENERGY")
                 {
                     UpdateSpecialAttack(value);
@@ -615,6 +831,10 @@ public partial class MainWindow : Window
                 else if (key == "SPECIAL_ATTACK_ACTIVE")
                 {
                     UpdateSpecialAttackActive(value);
+                }
+                else if (key.StartsWith("BUFF_") || key.StartsWith("POISON_") || key.StartsWith("STATUS_") || key == "AUTO_RETALIATE" || key == "RUN_MODE")
+                {
+                    UpdateBuffsAndStatusUi();
                 }
                 else if (key == "SLAYER_TASK")
                 {
@@ -737,9 +957,8 @@ public partial class MainWindow : Window
                         _dataItems.Add(new DataItem { Key = key, Value = value });
                 }
             }
-            }
-            catch { }
-        }));
+        }
+        catch { }
     }
 
     private void UpdateCurrentTab(string value)
@@ -866,9 +1085,252 @@ public partial class MainWindow : Window
             if (openBracket != -1 && closeBracket != -1)
             {
                 string prayerName = key.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim();
+                bool isActive = value.Equals("1") || 
+                               value.Equals("true", StringComparison.OrdinalIgnoreCase) || 
+                               value.Equals("active", StringComparison.OrdinalIgnoreCase);
+
                 if (_prayerMap.TryGetValue(prayerName, out var pvm))
                 {
-                    pvm.IsActive = (value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase));
+                    pvm.IsActive = isActive;
+                }
+                else
+                {
+                    string norm = prayerName.Replace(" ", "").Replace("_", "").ToLowerInvariant();
+                    var match = _prayers.FirstOrDefault(p => p.Name.Replace(" ", "").Replace("_", "").Equals(norm, StringComparison.OrdinalIgnoreCase));
+                    if (match != null)
+                    {
+                        match.IsActive = isActive;
+                        _prayerMap[prayerName] = match;
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void RefreshSkillsDisplay()
+    {
+        if (_displayedSkills == null) return;
+        _displayedSkills.Clear();
+        var tracker = SkillTrackerEngine.Instance;
+        if (tracker?.Skills != null)
+        {
+            foreach (var skill in tracker.Skills)
+            {
+                if (skill == null) continue;
+                if (_currentSkillFilter == "Active" && !skill.IsActive) continue;
+                if (_currentSkillFilter != "All" && _currentSkillFilter != "Active" && !skill.Category.Equals(_currentSkillFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                _displayedSkills.Add(skill);
+            }
+        }
+
+        if (tracker != null)
+        {
+            if (SkillsTotalLevelText != null) SkillsTotalLevelText.Text = tracker.TotalLevel.ToString();
+            if (SkillsTotalXpText != null) SkillsTotalXpText.Text = $"{tracker.TotalXp:N0} XP";
+            if (SkillsGainedText != null) SkillsGainedText.Text = tracker.TotalXpGainedFormatted;
+            if (SkillsRateText != null) SkillsRateText.Text = tracker.TotalXpPerHourFormatted;
+        }
+    }
+
+    private void SkillFilterBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SkillFilterBox?.SelectedItem is ComboBoxItem cbi && cbi.Tag is string tag)
+        {
+            _currentSkillFilter = tag;
+            RefreshSkillsDisplay();
+        }
+    }
+
+    private void ResetSkillTracker_Click(object sender, RoutedEventArgs e)
+    {
+        SkillTrackerEngine.Instance.ResetSession();
+        RefreshSkillsDisplay();
+    }
+
+    private void UpdatePlayerHitpoints(string value)
+    {
+        try
+        {
+            int slash = value.IndexOf('/');
+            int cur = 0, max = 0;
+            if (slash != -1)
+            {
+                int.TryParse(value.Substring(0, slash).Trim(), out cur);
+                int.TryParse(value.Substring(slash + 1).Trim(), out max);
+            }
+            else
+            {
+                int.TryParse(value.Trim(), out cur);
+                max = cur;
+            }
+
+            if (max <= 0) max = Math.Max(cur, 99);
+            if (PlayerHealthBar != null)
+            {
+                PlayerHealthBar.Maximum = max;
+                PlayerHealthBar.Value = Math.Clamp(cur, 0, max);
+            }
+            if (PlayerHealthText != null)
+            {
+                int pct = max > 0 ? (cur * 100 / max) : 0;
+                PlayerHealthText.Text = $"{cur} / {max} ({pct}%)";
+            }
+        }
+        catch { }
+    }
+
+    private void UpdatePlayerPrayer(string value)
+    {
+        try
+        {
+            int slash = value.IndexOf('/');
+            int cur = 0, max = 0;
+            if (slash != -1)
+            {
+                int.TryParse(value.Substring(0, slash).Trim(), out cur);
+                int.TryParse(value.Substring(slash + 1).Trim(), out max);
+            }
+            else
+            {
+                int.TryParse(value.Trim(), out cur);
+                max = cur;
+            }
+
+            if (max <= 0) max = Math.Max(cur, 99);
+            if (PlayerPrayerBar != null)
+            {
+                PlayerPrayerBar.Maximum = max;
+                PlayerPrayerBar.Value = Math.Clamp(cur, 0, max);
+            }
+            if (PlayerPrayerText != null)
+            {
+                int pct = max > 0 ? (cur * 100 / max) : 0;
+                PlayerPrayerText.Text = $"{cur} / {max} ({pct}%)";
+            }
+        }
+        catch { }
+    }
+
+    private void UpdatePlayerRunEnergy(string value)
+    {
+        try
+        {
+            string clean = value.Replace("%", "").Trim();
+            if (double.TryParse(clean, out double energy))
+            {
+                if (PlayerEnergyBar != null) PlayerEnergyBar.Value = Math.Clamp(energy, 0, 100);
+                if (PlayerEnergyText != null) PlayerEnergyText.Text = $"{energy:0}%";
+            }
+        }
+        catch { }
+    }
+
+    private void UpdatePlayerWeight(string value)
+    {
+        try
+        {
+            if (PlayerWeightText != null)
+            {
+                string clean = value.Trim();
+                if (!clean.EndsWith("kg", StringComparison.OrdinalIgnoreCase)) clean += " kg";
+                PlayerWeightText.Text = clean;
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateCombatStatus(string value)
+    {
+        try
+        {
+            bool inCombat = value.Equals("True", StringComparison.OrdinalIgnoreCase) || 
+                            value.Equals("1") || 
+                            value.Equals("Yes", StringComparison.OrdinalIgnoreCase);
+
+            if (PlayerCombatBadge != null)
+            {
+                PlayerCombatBadge.Background = inCombat 
+                    ? new SolidColorBrush(Color.FromRgb(80, 20, 20)) 
+                    : new SolidColorBrush(Color.FromRgb(37, 37, 53));
+            }
+            if (PlayerCombatText != null)
+            {
+                PlayerCombatText.Text = inCombat ? "IN COMBAT" : "Out of Combat";
+                PlayerCombatText.Foreground = inCombat 
+                    ? new SolidColorBrush(Color.FromRgb(255, 100, 100)) 
+                    : new SolidColorBrush(Color.FromRgb(160, 160, 176));
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateCombatTarget(string value)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Equals("None", StringComparison.OrdinalIgnoreCase) || value.Equals("null", StringComparison.OrdinalIgnoreCase))
+            {
+                if (PlayerTargetText != null)
+                {
+                    PlayerTargetText.Text = "None";
+                    PlayerTargetText.Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255));
+                }
+                if (CombatTargetHealthBar != null) CombatTargetHealthBar.Value = 0;
+                if (CombatTargetHealthText != null) CombatTargetHealthText.Text = "No Target";
+            }
+            else
+            {
+                if (PlayerTargetText != null)
+                {
+                    PlayerTargetText.Text = value.Trim();
+                    PlayerTargetText.Foreground = new SolidColorBrush(Color.FromRgb(255, 80, 80));
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateCombatTargetHealth(string value)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Equals("None", StringComparison.OrdinalIgnoreCase) || value == "-1")
+            {
+                if (CombatTargetHealthBar != null) CombatTargetHealthBar.Value = 0;
+                if (CombatTargetHealthText != null) CombatTargetHealthText.Text = "No Target";
+                return;
+            }
+
+            string clean = value.Replace("%", "").Trim();
+            if (double.TryParse(clean, out double pct))
+            {
+                if (CombatTargetHealthBar != null) CombatTargetHealthBar.Value = Math.Clamp(pct, 0, 100);
+                if (CombatTargetHealthText != null) CombatTargetHealthText.Text = $"{pct:0}%";
+            }
+            else
+            {
+                if (CombatTargetHealthText != null) CombatTargetHealthText.Text = value;
+            }
+        }
+        catch { }
+    }
+
+    private void UpdatePlayerAnimation(string value)
+    {
+        try
+        {
+            if (PlayerAnimationText != null)
+            {
+                if (value == "-1" || value == "Idle (-1)" || string.IsNullOrWhiteSpace(value))
+                {
+                    PlayerAnimationText.Text = "Idle (-1)";
+                    PlayerAnimationText.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 176));
+                }
+                else
+                {
+                    PlayerAnimationText.Text = value.StartsWith("Anim") ? value : $"Anim #{value}";
+                    PlayerAnimationText.Foreground = new SolidColorBrush(Color.FromRgb(255, 215, 0));
                 }
             }
         }
@@ -877,19 +1339,63 @@ public partial class MainWindow : Window
 
     private void UpdateSkill(string key, string value)
     {
-        // Format: SKILL[Attack]: 99
+        // Format: SKILL[Attack]: 99 or 99/99
         try
         {
             int openBracket = key.IndexOf('[');
             int closeBracket = key.IndexOf(']');
             if (openBracket != -1 && closeBracket != -1)
             {
-                string skillName = key.Substring(openBracket + 1, closeBracket - openBracket - 1);
+                string skillName = key.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim();
                 var existing = _skills.FirstOrDefault(s => s.Key == skillName);
                 if (existing != null)
                     existing.Value = value;
                 else
                     _skills.Add(new DataItem { Key = skillName, Value = value });
+
+                int slash = value.IndexOf('/');
+                if (slash != -1)
+                {
+                    if (int.TryParse(value.Substring(0, slash).Trim(), out int cur) && int.TryParse(value.Substring(slash + 1).Trim(), out int max))
+                    {
+                        SkillTrackerEngine.Instance.UpdateSkillLevels(skillName, cur, max);
+                    }
+                }
+                else if (int.TryParse(value.Trim(), out int lvl))
+                {
+                    SkillTrackerEngine.Instance.UpdateSkillLevels(skillName, lvl, lvl);
+                }
+
+                if (skillName.Equals("Hitpoints", StringComparison.OrdinalIgnoreCase))
+                {
+                    UpdatePlayerHitpoints(value);
+                }
+                else if (skillName.Equals("Prayer", StringComparison.OrdinalIgnoreCase))
+                {
+                    UpdatePlayerPrayer(value);
+                }
+
+                RefreshSkillsDisplay();
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateSkillXp(string key, string value)
+    {
+        // Format: SKILL_XP[Attack]: 13034431
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                string skillName = key.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim();
+                if (int.TryParse(value.Trim(), out int xp))
+                {
+                    SkillTrackerEngine.Instance.UpdateSkillXp(skillName, xp);
+                    RefreshSkillsDisplay();
+                }
             }
         }
         catch { }
@@ -897,7 +1403,8 @@ public partial class MainWindow : Window
 
     private void UpdateNpcList(string key, string value)
     {
-        // Format: NPC[0]: ID, Name, Distance, Health[, Category]
+        // Format: NPC[0]: ID, Name, Health%, WorldX, WorldY, Plane, Distance, InCombat, Anim, TargetingMe
+        // Fallback Format: NPC[0]: ID, Name, Distance, Health[, Category]
         try
         {
             int openBracket = key.IndexOf('[');
@@ -906,14 +1413,44 @@ public partial class MainWindow : Window
             {
                 int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
                 var parts = value.Split(',');
-                if (parts.Length >= 4)
+                if (parts.Length >= 7)
+                {
+                    string id = parts[0].Trim();
+                    string name = parts[1].Trim();
+                    string rawHp = parts[2].Trim();
+                    string hp = (rawHp == "-1" || string.IsNullOrEmpty(rawHp)) ? "100%" : (rawHp.EndsWith("%") ? rawHp : rawHp + "%");
+                    string dist = parts[6].Trim().EndsWith("m") ? parts[6].Trim() : parts[6].Trim() + "m";
+                    bool inCombat = parts.Length > 7 && parts[7].Trim() == "1";
+                    bool targetingMe = parts.Length > 9 && parts[9].Trim() == "1";
+                    string category = targetingMe ? "Aggressive" : (inCombat ? "In Combat" : "NPC");
+
+                    var npc = new NpcItem
+                    {
+                        Id = id,
+                        Name = name,
+                        Distance = dist,
+                        Health = hp,
+                        Category = category
+                    };
+
+                    if (category == "Slayer Master" && SlayerMasterNearbyText != null)
+                    {
+                        SlayerMasterNearbyText.Text = $"{npc.Name} ({npc.Distance})";
+                    }
+
+                    if (index < _npcs.Count)
+                        _npcs[index] = npc;
+                    else
+                        _npcs.Add(npc);
+                }
+                else if (parts.Length >= 4)
                 {
                     string category = parts.Length >= 5 ? parts[4].Trim() : "NPC";
                     var npc = new NpcItem
                     {
                         Id = parts[0].Trim(),
                         Name = parts[1].Trim(),
-                        Distance = parts[2].Trim() + "m",
+                        Distance = parts[2].Trim().EndsWith("m") ? parts[2].Trim() : parts[2].Trim() + "m",
                         Health = parts[3].Trim(),
                         Category = category
                     };
@@ -1173,6 +1710,165 @@ public partial class MainWindow : Window
         catch { }
     }
 
+    private void UpdateGrandExchangeOffer(string key, string value)
+    {
+        // Format: GE_SLOT[0]: State,ItemId,ItemName,Price,TotalQty,QtySold,Spent
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int slot = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                if (slot < 0 || slot >= 8) return;
+
+                var parts = value.Split(',');
+                if (parts.Length >= 7)
+                {
+                    string state = parts[0].Trim();
+                    int itemId = int.TryParse(parts[1].Trim(), out int id) ? id : 0;
+                    string name = parts[2].Trim();
+                    int price = int.TryParse(parts[3].Trim(), out int p) ? p : 0;
+                    int tot = int.TryParse(parts[4].Trim(), out int tq) ? tq : 0;
+                    int trans = int.TryParse(parts[5].Trim(), out int qt) ? qt : 0;
+                    int spent = int.TryParse(parts[6].Trim(), out int sp) ? sp : 0;
+
+                    if (slot < _geOffers.Count)
+                    {
+                        var offer = _geOffers[slot];
+                        offer.State = state;
+                        offer.ItemId = itemId;
+                        offer.ItemName = (itemId > 0 && !string.IsNullOrWhiteSpace(name) && name != "None") ? name : (itemId > 0 ? $"Item #{itemId}" : "Empty Slot");
+                        offer.Price = price;
+                        offer.TotalQuantity = tot;
+                        offer.QuantityTransferred = trans;
+                        offer.Spent = spent;
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateRunePouchSlot(string key, string value)
+    {
+        // Format: RUNE_POUCH[0]: typeIdx,runeName,qty
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int slot = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                if (slot < 0 || slot >= 4) return;
+
+                var parts = value.Split(',');
+                if (parts.Length >= 3)
+                {
+                    int runeId = int.TryParse(parts[0].Trim(), out int id) ? id : 0;
+                    string name = parts[1].Trim();
+                    int qty = int.TryParse(parts[2].Trim(), out int q) ? q : 0;
+
+                    if (slot < _runePouchSlots.Count)
+                    {
+                        var runeSlot = _runePouchSlots[slot];
+                        runeSlot.RuneId = runeId;
+                        runeSlot.RuneName = (runeId > 0 && !string.IsNullOrWhiteSpace(name) && name != "None") ? name : "Empty";
+                        runeSlot.Quantity = qty;
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateLootingBagItem(string key, string value)
+    {
+        // Format: LOOTING_BAG[0]: id,name,qty
+        try
+        {
+            int openBracket = key.IndexOf('[');
+            int closeBracket = key.IndexOf(']');
+            if (openBracket != -1 && closeBracket != -1)
+            {
+                int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
+                var parts = value.Split(',');
+                if (parts.Length >= 3)
+                {
+                    int id = int.TryParse(parts[0].Trim(), out int pid) ? pid : 0;
+                    if (id <= 0 || parts[0].Trim() == "0" || parts[0].Trim() == "-1" || parts[0].Trim().Equals("EMPTY", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (index < _lootingBagItems.Count)
+                            _lootingBagItems.RemoveAt(index);
+                        return;
+                    }
+
+                    var item = new ContainerItem
+                    {
+                        Id = parts[0].Trim(),
+                        Name = parts[1].Trim(),
+                        Quantity = parts[2].Trim()
+                    };
+                    if (index < _lootingBagItems.Count)
+                        _lootingBagItems[index] = item;
+                    else
+                        _lootingBagItems.Add(item);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateGemBagUi(string value)
+    {
+        // Format: GEM_BAG: s,e,r,d,ds
+        try
+        {
+            var parts = value.Split(',');
+            if (parts.Length >= 5)
+            {
+                int s = int.TryParse(parts[0].Trim(), out int ps) ? ps : 0;
+                int e = int.TryParse(parts[1].Trim(), out int pe) ? pe : 0;
+                int r = int.TryParse(parts[2].Trim(), out int pr) ? pr : 0;
+                int d = int.TryParse(parts[3].Trim(), out int pd) ? pd : 0;
+                int ds = int.TryParse(parts[4].Trim(), out int pds) ? pds : 0;
+
+                if (GemBagSapphireText != null) GemBagSapphireText.Text = s.ToString();
+                if (GemBagEmeraldText != null) GemBagEmeraldText.Text = e.ToString();
+                if (GemBagRubyText != null) GemBagRubyText.Text = r.ToString();
+                if (GemBagDiamondText != null) GemBagDiamondText.Text = d.ToString();
+                if (GemBagDragonstoneText != null) GemBagDragonstoneText.Text = ds.ToString();
+                if (GemBagTotalText != null) GemBagTotalText.Text = (s + e + r + d + ds).ToString();
+            }
+        }
+        catch { }
+    }
+
+    private void UpdateEssencePouchesUi(string value)
+    {
+        // Format: ESSENCE_POUCHES: small,med,large,giant,colossal
+        try
+        {
+            var parts = value.Split(',');
+            if (parts.Length >= 5)
+            {
+                int sm = int.TryParse(parts[0].Trim(), out int psm) ? psm : 0;
+                int md = int.TryParse(parts[1].Trim(), out int pmd) ? pmd : 0;
+                int lg = int.TryParse(parts[2].Trim(), out int plg) ? plg : 0;
+                int gt = int.TryParse(parts[3].Trim(), out int pgt) ? pgt : 0;
+                int col = int.TryParse(parts[4].Trim(), out int pcol) ? pcol : 0;
+
+                if (EssPouchSmallText != null) EssPouchSmallText.Text = sm.ToString();
+                if (EssPouchMedText != null) EssPouchMedText.Text = md.ToString();
+                if (EssPouchLargeText != null) EssPouchLargeText.Text = lg.ToString();
+                if (EssPouchGiantText != null) EssPouchGiantText.Text = gt.ToString();
+                if (EssPouchColossalText != null) EssPouchColossalText.Text = col.ToString();
+                if (EssPouchTotalText != null) EssPouchTotalText.Text = (sm + md + lg + gt + col).ToString();
+            }
+        }
+        catch { }
+    }
+
     private void UpdateSpecialAttack(string value)
     {
         string clean = value.Replace("%", "").Trim();
@@ -1192,6 +1888,218 @@ public partial class MainWindow : Window
             SpecActiveBadge.Background = isActive ? new SolidColorBrush(Color.FromRgb(30, 60, 45)) : new SolidColorBrush(Color.FromRgb(42, 42, 42));
             SpecActiveText.Text = isActive ? "Active" : "Inactive";
             SpecActiveText.Foreground = isActive ? new SolidColorBrush(Color.FromRgb(76, 175, 80)) : Brushes.Gray;
+        }
+    }
+
+    private void UpdateBuffsAndStatusUi()
+    {
+        var effects = BrainEngine.Instance.State.StatusEffects;
+        if (effects == null) return;
+
+        // Stamina
+        if (BuffStaminaText != null)
+        {
+            if (effects.HasStamina)
+            {
+                BuffStaminaText.Text = effects.StaminaDurationFormatted;
+                BuffStaminaText.Foreground = new SolidColorBrush(Color.FromRgb(251, 191, 36));
+            }
+            else
+            {
+                BuffStaminaText.Text = "Inactive";
+                BuffStaminaText.Foreground = Brushes.Gray;
+            }
+        }
+
+        // Antifire
+        if (BuffAntifireText != null)
+        {
+            if (effects.HasAntifire)
+            {
+                string type = effects.IsSuperAntifire ? "Super (" : "Active (";
+                BuffAntifireText.Text = type + effects.AntifireDurationFormatted + ")";
+                BuffAntifireText.Foreground = new SolidColorBrush(Color.FromRgb(129, 199, 132));
+            }
+            else
+            {
+                BuffAntifireText.Text = "Inactive";
+                BuffAntifireText.Foreground = Brushes.Gray;
+            }
+        }
+
+        // Poison / Venom
+        if (BuffPoisonText != null)
+        {
+            if (effects.IsEnvenomed)
+            {
+                BuffPoisonText.Text = $"Venomed ({effects.VenomDamage} dmg)";
+                BuffPoisonText.Foreground = new SolidColorBrush(Color.FromRgb(52, 211, 153));
+            }
+            else if (effects.IsPoisoned)
+            {
+                BuffPoisonText.Text = $"Poisoned ({effects.PoisonDamage} dmg)";
+                BuffPoisonText.Foreground = new SolidColorBrush(Color.FromRgb(74, 222, 128));
+            }
+            else if (effects.HasImmunity)
+            {
+                BuffPoisonText.Text = $"Immune ({effects.ImmunityDurationFormatted})";
+                BuffPoisonText.Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248));
+            }
+            else
+            {
+                BuffPoisonText.Text = "Healthy";
+                BuffPoisonText.Foreground = new SolidColorBrush(Color.FromRgb(52, 211, 153));
+            }
+        }
+
+        // Overload
+        if (BuffOverloadText != null)
+        {
+            if (effects.HasOverload)
+            {
+                BuffOverloadText.Text = effects.OverloadDurationFormatted;
+                BuffOverloadText.Foreground = new SolidColorBrush(Color.FromRgb(167, 139, 250));
+            }
+            else
+            {
+                BuffOverloadText.Text = "Inactive";
+                BuffOverloadText.Foreground = Brushes.Gray;
+            }
+        }
+
+        // Divine
+        if (BuffDivineText != null)
+        {
+            if (effects.HasDivine)
+            {
+                BuffDivineText.Text = effects.DivineDurationFormatted;
+                BuffDivineText.Foreground = new SolidColorBrush(Color.FromRgb(96, 165, 250));
+            }
+            else
+            {
+                BuffDivineText.Text = "Inactive";
+                BuffDivineText.Foreground = Brushes.Gray;
+            }
+        }
+
+        // Imbued Heart
+        if (BuffHeartText != null)
+        {
+            if (effects.IsImbuedHeartReady)
+            {
+                BuffHeartText.Text = "Ready";
+                BuffHeartText.Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248));
+            }
+            else
+            {
+                BuffHeartText.Text = $"Cooldown ({effects.ImbuedHeartCooldownFormatted})";
+                BuffHeartText.Foreground = new SolidColorBrush(Color.FromRgb(248, 113, 113));
+            }
+        }
+
+        // Prayer Enhance
+        if (BuffPrayerEnhanceText != null)
+        {
+            if (effects.HasPrayerEnhance)
+            {
+                BuffPrayerEnhanceText.Text = effects.PrayerEnhanceDurationFormatted;
+                BuffPrayerEnhanceText.Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255));
+            }
+            else
+            {
+                BuffPrayerEnhanceText.Text = "Inactive";
+                BuffPrayerEnhanceText.Foreground = Brushes.Gray;
+            }
+        }
+
+        // Charge
+        if (BuffChargeText != null)
+        {
+            if (effects.HasCharge)
+            {
+                BuffChargeText.Text = "Active (" + effects.ChargeTicks + "t)";
+                BuffChargeText.Foreground = new SolidColorBrush(Color.FromRgb(251, 146, 60));
+            }
+            else
+            {
+                BuffChargeText.Text = "Inactive";
+                BuffChargeText.Foreground = Brushes.Gray;
+            }
+        }
+
+        // Toggles
+        if (BuffTogglesText != null)
+        {
+            string ret = effects.AutoRetaliate ? "ON" : "OFF";
+            string run = effects.RunEnabled ? "ON" : "OFF";
+            BuffTogglesText.Text = $"Retaliate: {ret} | Run: {run}";
+            BuffTogglesText.Foreground = new SolidColorBrush(Color.FromRgb(203, 213, 225));
+        }
+
+        // Poison Status Badge
+        if (PoisonStatusText != null)
+        {
+            if (effects.IsPoisoned)
+            {
+                PoisonStatusText.Text = $"Poison: {effects.PoisonDamage} dmg";
+                PoisonStatusText.Foreground = new SolidColorBrush(Color.FromRgb(74, 222, 128));
+            }
+            else if (effects.HasImmunity)
+            {
+                PoisonStatusText.Text = "Poison: Immune";
+                PoisonStatusText.Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248));
+            }
+            else
+            {
+                PoisonStatusText.Text = "Poison: Normal";
+                PoisonStatusText.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 176));
+            }
+        }
+
+        // Venom Status Badge
+        if (VenomStatusText != null)
+        {
+            if (effects.IsEnvenomed)
+            {
+                VenomStatusText.Text = $"Venom: {effects.VenomDamage} dmg";
+                VenomStatusText.Foreground = new SolidColorBrush(Color.FromRgb(52, 211, 153));
+            }
+            else
+            {
+                VenomStatusText.Text = "Venom: None";
+                VenomStatusText.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 176));
+            }
+        }
+
+        // Freeze Status Badge
+        if (FreezeStatusText != null)
+        {
+            if (effects.FreezeTicks > 0)
+            {
+                FreezeStatusText.Text = $"Frozen ({effects.FreezeTicks}t)";
+                FreezeStatusText.Foreground = new SolidColorBrush(Color.FromRgb(96, 165, 250));
+            }
+            else
+            {
+                FreezeStatusText.Text = "Freeze: None";
+                FreezeStatusText.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 176));
+            }
+        }
+
+        // Vengeance Status Badge
+        if (VengeanceStatusText != null)
+        {
+            bool veng = BrainEngine.Instance.State.Player?.IsVengeanceActive ?? false;
+            if (veng)
+            {
+                VengeanceStatusText.Text = "Veng: ACTIVE";
+                VengeanceStatusText.Foreground = new SolidColorBrush(Color.FromRgb(248, 113, 113));
+            }
+            else
+            {
+                VengeanceStatusText.Text = "Veng: Inactive";
+                VengeanceStatusText.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 176));
+            }
         }
     }
 
@@ -1458,7 +2366,8 @@ public partial class MainWindow : Window
 
     private void UpdatePlayerList(string key, string value)
     {
-        // Format: NEARBY_PLAYER[0]: ID, Name, Distance, CombatLevel
+        // Format: PLAYER[0]: Name, CombatLevel, WorldX, WorldY, Plane, Distance, InCombat, Anim, Interacting
+        // Fallback Format: NEARBY_PLAYER[0]: ID, Name, Distance, CombatLevel
         try
         {
             int openBracket = key.IndexOf('[');
@@ -1467,13 +2376,33 @@ public partial class MainWindow : Window
             {
                 int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
                 var parts = value.Split(',');
-                if (parts.Length >= 4)
+                if (parts.Length >= 6)
+                {
+                    string name = parts[0].Trim();
+                    string cbLvl = "Lvl " + parts[1].Trim();
+                    string dist = parts[5].Trim().EndsWith("m") ? parts[5].Trim() : parts[5].Trim() + "m";
+                    string id = (index + 1).ToString();
+
+                    var player = new PlayerItem
+                    {
+                        Id = id,
+                        Name = name,
+                        Distance = dist,
+                        CombatLevel = cbLvl
+                    };
+
+                    if (index < _players.Count)
+                        _players[index] = player;
+                    else
+                        _players.Add(player);
+                }
+                else if (parts.Length >= 4)
                 {
                     var player = new PlayerItem
                     {
                         Id = parts[0].Trim(),
                         Name = parts[1].Trim(),
-                        Distance = parts[2].Trim(),
+                        Distance = parts[2].Trim().EndsWith("m") ? parts[2].Trim() : parts[2].Trim() + "m",
                         CombatLevel = parts[3].Trim()
                     };
 
@@ -1487,9 +2416,152 @@ public partial class MainWindow : Window
         catch { }
     }
 
+    private static bool TryParseItemPayload(string value, out int id, out string name, out int qty)
+    {
+        id = -1;
+        name = "";
+        qty = 0;
+
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        value = value.Trim();
+
+        if (value.Equals("EMPTY", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("Empty", StringComparison.OrdinalIgnoreCase) ||
+            value == "0" || value == "-1" || value == "65535" || value == "0,0" ||
+            value.StartsWith("0,0") || value.StartsWith("0,None") || value.StartsWith("-1,Empty"))
+        {
+            return false;
+        }
+
+        var parts = value.Split(',');
+        if (parts.Length == 3)
+        {
+            // Format: ID, Name, Quantity
+            if (int.TryParse(parts[0].Trim(), out int parsedId)) id = parsedId;
+            name = parts[1].Trim();
+            if (int.TryParse(parts[2].Trim(), out int parsedQty)) qty = parsedQty;
+            else qty = 1;
+
+            if (id > 0 && id != 65535 && !name.Equals("EMPTY", StringComparison.OrdinalIgnoreCase))
+            {
+                ItemDatabase.RegisterItem(id, name);
+                if (name.StartsWith("Item #", StringComparison.OrdinalIgnoreCase))
+                {
+                    name = ItemDatabase.ResolveItemName(name);
+                }
+                return true;
+            }
+            return false;
+        }
+        else if (parts.Length == 2)
+        {
+            // Could be "ID, Quantity" or "Name, Quantity" or "ID, Name"
+            if (int.TryParse(parts[0].Trim(), out int parsedId))
+            {
+                id = parsedId;
+                if (int.TryParse(parts[1].Trim(), out int parsedQty))
+                {
+                    qty = parsedQty;
+                    name = ItemDatabase.GetItemName(id);
+                }
+                else
+                {
+                    name = parts[1].Trim();
+                    qty = 1;
+                    ItemDatabase.RegisterItem(id, name);
+                }
+
+                if (id > 0 && id != 65535 && !name.Equals("EMPTY", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+                return false;
+            }
+            else
+            {
+                name = parts[0].Trim();
+                if (int.TryParse(parts[1].Trim(), out int parsedQty)) qty = parsedQty;
+                else qty = 1;
+
+                return !string.IsNullOrEmpty(name) && !name.Equals("EMPTY", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        else if (parts.Length == 1)
+        {
+            if (int.TryParse(value, out int parsedId))
+            {
+                id = parsedId;
+                if (id > 0 && id != 65535)
+                {
+                    name = ItemDatabase.GetItemName(id);
+                    qty = 1;
+                    return true;
+                }
+                return false;
+            }
+            else
+            {
+                name = value;
+                qty = 1;
+                return !string.IsNullOrEmpty(name) && !name.Equals("EMPTY", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        return false;
+    }
+
+    private static string FormatItemQuantity(int qty)
+    {
+        if (qty >= 10_000_000) return $"{qty / 1_000_000}M";
+        if (qty >= 100_000) return $"{qty / 1_000}K";
+        return qty.ToString();
+    }
+
+    private static System.Windows.Media.Brush GetQuantityBrush(int qty)
+    {
+        if (qty >= 10_000_000) return new SolidColorBrush(Color.FromRgb(0, 255, 128));
+        if (qty >= 100_000) return Brushes.White;
+        return new SolidColorBrush(Color.FromRgb(255, 255, 0));
+    }
+
+    private static string GetEquipmentSlotDefaultName(string slotId) => slotId switch
+    {
+        "0" => "Head",
+        "1" => "Cape",
+        "2" => "Neck",
+        "3" => "Weapon",
+        "4" => "Body",
+        "5" => "Shield",
+        "7" => "Legs",
+        "9" => "Hands",
+        "10" => "Feet",
+        "12" => "Ring",
+        "13" => "Ammo",
+        _ => $"Slot {slotId}"
+    };
+
+    private void ResetEquipmentSlotUi(string slotId, Border border)
+    {
+        border.Background = new SolidColorBrush(Color.FromRgb(28, 30, 36));
+        border.BorderBrush = new SolidColorBrush(Color.FromRgb(55, 60, 70));
+        border.CornerRadius = new CornerRadius(4);
+        string slotName = GetEquipmentSlotDefaultName(slotId);
+        border.ToolTip = $"{slotName} (Empty)";
+        border.Child = new TextBlock
+        {
+            Text = slotName,
+            FontSize = 9,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = new SolidColorBrush(Color.FromRgb(95, 100, 115)),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextAlignment = TextAlignment.Center
+        };
+    }
+
     private void UpdateEquipmentSlot(string key, string value)
     {
-        // Format: EQUIP[slotId]: ID, Quantity or Name, Quantity
+        // Format: EQUIP[slotId]: ID, Name, Quantity
         try
         {
             int openBracket = key.IndexOf('[');
@@ -1499,39 +2571,51 @@ public partial class MainWindow : Window
                 string slotId = key.Substring(openBracket + 1, closeBracket - openBracket - 1);
                 if (_equipmentSlots.TryGetValue(slotId, out var border))
                 {
-                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "65535" || value == "0,0" || value.StartsWith("0,") || value.StartsWith("-1,") || value.StartsWith("65535,"))
+                    if (TryParseItemPayload(value, out int id, out string name, out int qty))
                     {
-                        border.Background = new SolidColorBrush(Color.FromRgb(42, 42, 42));
-                        border.ToolTip = null;
-                        border.Child = null;
-                    }
-                    else
-                    {
-                        int lastComma = value.LastIndexOf(',');
-                        string displayText = lastComma >= 0 ? value.Substring(0, lastComma).Trim() : value.Trim();
-                        int qty = 1;
-                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int parsedQty))
+                        border.Background = new SolidColorBrush(Color.FromRgb(24, 48, 76));
+                        border.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 180, 216));
+                        string slotName = GetEquipmentSlotDefaultName(slotId);
+                        string qtyDisplay = qty > 1 ? $" (x{qty:N0})" : "";
+                        string idDisplay = id > 0 ? $" [ID: {id}]" : "";
+                        border.ToolTip = $"{slotName}: {name}{idDisplay}{qtyDisplay}";
+
+                        var cellGrid = new Grid();
+
+                        var nameText = new TextBlock
                         {
-                            qty = parsedQty;
-                        }
-
-                        displayText = ItemDatabase.ResolveItemName(displayText);
-
-                        string toolTipText = qty > 1 ? $"{displayText} (x{qty})" : displayText;
-                        string labelText = qty > 1 ? $"{displayText}\nx{qty}" : displayText;
-
-                        border.Background = new SolidColorBrush(Color.FromRgb(0, 100, 150));
-                        border.ToolTip = toolTipText;
-                        border.Child = new TextBlock
-                        {
-                            Text = labelText,
-                            FontSize = 7.5,
+                            Text = name,
+                            FontSize = 8,
+                            FontWeight = FontWeights.SemiBold,
                             Foreground = Brushes.White,
                             TextWrapping = TextWrapping.Wrap,
                             TextAlignment = TextAlignment.Center,
                             HorizontalAlignment = HorizontalAlignment.Center,
-                            VerticalAlignment = VerticalAlignment.Center
+                            VerticalAlignment = VerticalAlignment.Center,
+                            Margin = new Thickness(2)
                         };
+                        cellGrid.Children.Add(nameText);
+
+                        if (qty > 1)
+                        {
+                            var qtyText = new TextBlock
+                            {
+                                Text = FormatItemQuantity(qty),
+                                FontSize = 7.5,
+                                FontWeight = FontWeights.Bold,
+                                Foreground = GetQuantityBrush(qty),
+                                HorizontalAlignment = HorizontalAlignment.Right,
+                                VerticalAlignment = VerticalAlignment.Top,
+                                Margin = new Thickness(0, 1, 2, 0)
+                            };
+                            cellGrid.Children.Add(qtyText);
+                        }
+
+                        border.Child = cellGrid;
+                    }
+                    else
+                    {
+                        ResetEquipmentSlotUi(slotId, border);
                     }
                 }
             }
@@ -1541,7 +2625,7 @@ public partial class MainWindow : Window
 
     private void UpdateInventorySlot(string key, string value)
     {
-        // Format: INV[0]: ID, Quantity or Name, Quantity
+        // Format: INV[0]: ID, Name, Quantity
         try
         {
             int openBracket = key.IndexOf('[');
@@ -1549,41 +2633,57 @@ public partial class MainWindow : Window
             if (openBracket != -1 && closeBracket != -1)
             {
                 int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
-                if (index >= 0 && index < 28)
+                if (index >= 0 && index < 28 && _inventorySlots[index] != null)
                 {
-                    if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "-1" || value == "65535" || value == "0,0" || value.StartsWith("0,") || value.StartsWith("-1,") || value.StartsWith("65535,"))
+                    if (TryParseItemPayload(value, out int id, out string name, out int qty))
                     {
-                        _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128));
-                        _inventorySlots[index].ToolTip = $"Slot {index + 1}: Empty";
-                        _inventorySlots[index].Child = null;
-                    }
-                    else
-                    {
-                        int lastComma = value.LastIndexOf(',');
-                        string displayText = lastComma >= 0 ? value.Substring(0, lastComma).Trim() : value.Trim();
-                        int qty = 1;
-                        if (lastComma >= 0 && int.TryParse(value.Substring(lastComma + 1).Trim(), out int parsedQty))
+                        var slotBorder = _inventorySlots[index];
+                        slotBorder.Background = new SolidColorBrush(Color.FromRgb(24, 48, 76));
+                        slotBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 180, 216));
+                        string qtyDisplay = qty > 1 ? $" (x{qty:N0})" : "";
+                        string idDisplay = id > 0 ? $" [ID: {id}]" : "";
+                        slotBorder.ToolTip = $"Slot {index + 1}: {name}{idDisplay}{qtyDisplay}";
+
+                        var cellGrid = new Grid();
+
+                        var nameText = new TextBlock
                         {
-                            qty = parsedQty;
-                        }
-
-                        displayText = ItemDatabase.ResolveItemName(displayText);
-
-                        string toolTipText = qty > 1 ? $"{displayText} (x{qty})" : displayText;
-                        string labelText = qty > 1 ? $"{displayText}\nx{qty}" : displayText;
-
-                        _inventorySlots[index].Background = new SolidColorBrush(Color.FromArgb(140, 0, 110, 180));
-                        _inventorySlots[index].ToolTip = toolTipText;
-                        _inventorySlots[index].Child = new TextBlock 
-                        { 
-                            Text = labelText, 
-                            FontSize = 7.5, 
+                            Text = name,
+                            FontSize = 8,
+                            FontWeight = FontWeights.SemiBold,
                             Foreground = Brushes.White,
                             TextWrapping = TextWrapping.Wrap,
                             TextAlignment = TextAlignment.Center,
                             HorizontalAlignment = HorizontalAlignment.Center,
-                            VerticalAlignment = VerticalAlignment.Center
+                            VerticalAlignment = VerticalAlignment.Center,
+                            Margin = new Thickness(2)
                         };
+                        cellGrid.Children.Add(nameText);
+
+                        if (qty > 1)
+                        {
+                            var qtyText = new TextBlock
+                            {
+                                Text = FormatItemQuantity(qty),
+                                FontSize = 7.5,
+                                FontWeight = FontWeights.Bold,
+                                Foreground = GetQuantityBrush(qty),
+                                HorizontalAlignment = HorizontalAlignment.Right,
+                                VerticalAlignment = VerticalAlignment.Top,
+                                Margin = new Thickness(0, 1, 2, 0)
+                            };
+                            cellGrid.Children.Add(qtyText);
+                        }
+
+                        slotBorder.Child = cellGrid;
+                    }
+                    else
+                    {
+                        var slotBorder = _inventorySlots[index];
+                        slotBorder.Background = new SolidColorBrush(Color.FromArgb(50, 30, 34, 42));
+                        slotBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(50, 55, 65));
+                        slotBorder.ToolTip = $"Slot {index + 1}: Empty";
+                        slotBorder.Child = null;
                     }
                 }
             }
@@ -2588,6 +3688,9 @@ public partial class MainWindow : Window
         _botTimer.Interval = TimeSpan.FromSeconds(1);
         _botTimer.Tick += (s, e) =>
         {
+            SkillTrackerEngine.Instance.UpdateTimerTick();
+            RefreshSkillsDisplay();
+
             if (ScriptRunner.Instance.Status == ScriptStatus.Running)
             {
                 BotRuntimeText.Text = ScriptRunner.Instance.Runtime.ToString(@"hh\:mm\:ss");
@@ -2602,7 +3705,7 @@ public partial class MainWindow : Window
         if (idx >= 0 && idx < ScriptRunner.Instance.RegisteredBots.Count)
         {
             var bot = ScriptRunner.Instance.RegisteredBots[idx];
-            BotTaskText.Text = $"Selected: {bot.Name}";
+            if (BotTaskText != null) BotTaskText.Text = $"Selected: {bot.Name}";
             AppendBotConsole($"[Manager] Selected '{bot.Name}' v{bot.Version} ({bot.Category}) - {bot.Description}");
         }
     }
@@ -2676,6 +3779,7 @@ public partial class MainWindow : Window
 
     private void AppendBotConsole(string msg)
     {
+        if (BotConsoleTextBox == null) return;
         string time = DateTime.Now.ToString("HH:mm:ss");
         BotConsoleTextBox.AppendText($"[{time}] {msg}\n");
         BotConsoleTextBox.ScrollToEnd();
@@ -2762,17 +3866,21 @@ public partial class MainWindow : Window
 
     private void LoadScriptIntoEditor(CustomScriptDefinition def)
     {
-        CreatorScriptNameBox.Text = def.Name;
-        CreatorDescBox.Text = def.Description;
-        CreatorMinDelayBox.Text = def.MinLoopDelayMs.ToString();
-        CreatorMaxDelayBox.Text = def.MaxLoopDelayMs.ToString();
+        if (CreatorScriptNameBox != null) CreatorScriptNameBox.Text = def.Name;
+        if (CreatorDescBox != null) CreatorDescBox.Text = def.Description;
+        if (CreatorMinDelayBox != null) CreatorMinDelayBox.Text = def.MinLoopDelayMs.ToString();
+        if (CreatorMaxDelayBox != null) CreatorMaxDelayBox.Text = def.MaxLoopDelayMs.ToString();
 
-        foreach (ComboBoxItem item in CreatorCategoryComboBox.Items)
+        if (CreatorCategoryComboBox != null)
         {
-            if (item.Content?.ToString()?.Equals(def.Category, StringComparison.OrdinalIgnoreCase) == true)
+            foreach (var rawItem in CreatorCategoryComboBox.Items)
             {
-                CreatorCategoryComboBox.SelectedItem = item;
-                break;
+                string? text = rawItem is ComboBoxItem cbi ? cbi.Content?.ToString() : rawItem?.ToString();
+                if (text?.Equals(def.Category, StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    CreatorCategoryComboBox.SelectedItem = rawItem;
+                    break;
+                }
             }
         }
 
@@ -2782,7 +3890,7 @@ public partial class MainWindow : Window
             _creatorSteps.Add(step);
         }
 
-        if (_creatorSteps.Count > 0)
+        if (_creatorSteps.Count > 0 && CreatorStepsListBox != null)
         {
             CreatorStepsListBox.SelectedIndex = 0;
         }
@@ -2803,23 +3911,23 @@ public partial class MainWindow : Window
 
     private void CreatorStepsListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (CreatorStepsListBox.SelectedItem is CustomActionStep step)
+        if (CreatorStepsListBox?.SelectedItem is CustomActionStep step)
         {
-            StepTitleBox.Text = step.Title;
-            StepConditionArgBox.Text = step.ConditionArg;
-            StepTargetNameBox.Text = step.TargetName;
-            StepActionVerbBox.Text = step.ActionVerb;
-            StepParam1Box.Text = step.Param1;
-            StepWaitBox.Text = step.WaitAfterMs.ToString();
+            if (StepTitleBox != null) StepTitleBox.Text = step.Title;
+            if (StepConditionArgBox != null) StepConditionArgBox.Text = step.ConditionArg;
+            if (StepTargetNameBox != null) StepTargetNameBox.Text = step.TargetName;
+            if (StepActionVerbBox != null) StepActionVerbBox.Text = step.ActionVerb;
+            if (StepParam1Box != null) StepParam1Box.Text = step.Param1;
+            if (StepWaitBox != null) StepWaitBox.Text = step.WaitAfterMs.ToString();
 
             int condIdx = (int)step.Condition;
-            if (condIdx >= 0 && condIdx < StepConditionComboBox.Items.Count)
+            if (StepConditionComboBox != null && condIdx >= 0 && condIdx < StepConditionComboBox.Items.Count)
             {
                 StepConditionComboBox.SelectedIndex = condIdx;
             }
 
             int actIdx = (int)step.ActionType;
-            if (actIdx >= 0 && actIdx < StepActionTypeComboBox.Items.Count)
+            if (StepActionTypeComboBox != null && actIdx >= 0 && actIdx < StepActionTypeComboBox.Items.Count)
             {
                 StepActionTypeComboBox.SelectedIndex = actIdx;
             }
@@ -2828,7 +3936,7 @@ public partial class MainWindow : Window
 
     private void StepActionTypeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (StepTargetLabel == null || StepVerbLabel == null || StepParam1Label == null) return;
+        if (StepTargetLabel == null || StepVerbLabel == null || StepParam1Label == null || StepTargetNameBox == null || StepActionVerbBox == null || StepParam1Box == null) return;
 
         int idx = StepActionTypeComboBox.SelectedIndex;
         if (idx < 0) return;
@@ -3180,9 +4288,13 @@ public partial class MainWindow : Window
             Width = 650,
             Height = 500,
             Background = new SolidColorBrush(Color.FromRgb(30, 30, 30)),
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Owner = this
+            WindowStartupLocation = WindowStartupLocation.CenterScreen
         };
+        if (this.IsLoaded && this.IsVisible)
+        {
+            viewerWindow.Owner = this;
+            viewerWindow.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        }
 
         var grid = new Grid { Margin = new Thickness(10) };
         grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -3233,8 +4345,9 @@ public partial class MainWindow : Window
 
     private void SavedScriptsComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (SavedScriptsComboBox == null) return;
         int idx = SavedScriptsComboBox.SelectedIndex;
-        if (idx >= 0 && idx < _savedCustomScripts.Count)
+        if (idx >= 0 && _savedCustomScripts != null && idx < _savedCustomScripts.Count)
         {
             LoadScriptIntoEditor(_savedCustomScripts[idx]);
         }
@@ -3282,13 +4395,21 @@ public partial class MainWindow : Window
                     Version = bot.Version
                 };
             }
-            var popout = new ScriptPopoutWindow(def) { Owner = this };
+            var popout = new ScriptPopoutWindow(def);
+            if (this.IsLoaded && this.IsVisible) popout.Owner = this;
             popout.Show();
         }
         else
         {
             MessageBox.Show("Please select a script from the dropdown first.", "No Script Selected", MessageBoxButton.OK, MessageBoxImage.Information);
         }
+    }
+
+    private void OpenScriptStudioBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var studio = new ScriptStudioWindow();
+        if (this.IsLoaded && this.IsVisible) studio.Owner = this;
+        studio.Show();
     }
 
     private void PopoutCreatorScriptBtn_Click(object sender, RoutedEventArgs e)
@@ -3310,7 +4431,8 @@ public partial class MainWindow : Window
             Steps = _creatorSteps.ToList()
         };
 
-        var popout = new ScriptPopoutWindow(def) { Owner = this };
+        var popout = new ScriptPopoutWindow(def);
+        if (this.IsLoaded && this.IsVisible) popout.Owner = this;
         popout.Show();
     }
 
@@ -3395,7 +4517,8 @@ public partial class MainWindow : Window
 
             AppendBotConsole($"[AI Assistant] Imported '{def.Name}' ({def.Steps.Count} steps)");
 
-            var popout = new ScriptPopoutWindow(def) { Owner = this };
+            var popout = new ScriptPopoutWindow(def);
+            if (this.IsLoaded && this.IsVisible) popout.Owner = this;
             popout.Show();
         }
         catch (Exception ex)
@@ -3431,14 +4554,17 @@ public partial class MainWindow : Window
 
     private void CreatorNearbyNpcsList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (CreatorNearbyNpcsList.SelectedItem is NpcItem npc)
+        if (CreatorNearbyNpcsList?.SelectedItem is NpcItem npc)
         {
             string rawName = npc.Name;
-            int idx = rawName.IndexOf('(');
-            if (idx > 0) rawName = rawName.Substring(0, idx).Trim();
+            if (!string.IsNullOrEmpty(rawName))
+            {
+                int idx = rawName.IndexOf('(');
+                if (idx > 0) rawName = rawName.Substring(0, idx).Trim();
 
-            RefreshCreatorLootTable(rawName);
-            AppendBotConsole($"[Script Creator] Selected target monster: '{rawName}' - loaded loot table.");
+                RefreshCreatorLootTable(rawName);
+                AppendBotConsole($"[Script Creator] Selected target monster: '{rawName}' - loaded loot table.");
+            }
         }
     }
 
@@ -3528,11 +4654,12 @@ public partial class MainWindow : Window
             if (parenIdx > 0) monsterName = monsterName.Substring(0, parenIdx).Trim();
         }
 
-        foreach (ComboBoxItem item in CreatorCategoryComboBox.Items)
+        foreach (var rawItem in CreatorCategoryComboBox.Items)
         {
-            if (item.Content?.ToString()?.Equals("Combat", StringComparison.OrdinalIgnoreCase) == true)
+            string? text = rawItem is ComboBoxItem cbi ? cbi.Content?.ToString() : rawItem?.ToString();
+            if (text?.Equals("Combat", StringComparison.OrdinalIgnoreCase) == true)
             {
-                CreatorCategoryComboBox.SelectedItem = item;
+                CreatorCategoryComboBox.SelectedItem = rawItem;
                 break;
             }
         }
@@ -3799,19 +4926,14 @@ public partial class MainWindow : Window
                     proc.EnableRaisingEvents = true;
                     proc.Exited += (s, e) =>
                     {
-                        LogMessage($"[LIFECYCLE] Monitored game client (PID {pid}) closed.");
+                        LogMessage($"[LIFECYCLE] Monitored process PID {pid} exited.");
+                        _trackedRuneLiteProcess = null;
                         Dispatcher.Invoke(() =>
                         {
-                            UpdateStatus("RuneLite closed. Shutting down bridge...", Brushes.Orange);
-                        });
-
-                        Task.Delay(300).ContinueWith(_ =>
-                        {
-                            Dispatcher.Invoke(() =>
+                            if (!_isAgentConnected && !_isTcpConnected)
                             {
-                                try { Application.Current.Shutdown(); } catch { }
-                                try { Environment.Exit(0); } catch { }
-                            });
+                                UpdateStatus("RuneLite process exited. Scanning for active client...", Brushes.Yellow);
+                            }
                         });
                     };
                     LogMessage($"[LIFECYCLE] Tracking RuneLite client lifecycle on PID {pid}.");
@@ -4055,6 +5177,18 @@ public static class ItemDatabase
         Task.Run(InitializeOnlineMappingAsync);
     }
 
+    public static void RegisterItem(int id, string name)
+    {
+        if (id > 0 && !string.IsNullOrWhiteSpace(name) && 
+            !name.StartsWith("Item #", StringComparison.OrdinalIgnoreCase) &&
+            !name.Equals("Empty", StringComparison.OrdinalIgnoreCase) &&
+            !name.Equals("EMPTY", StringComparison.OrdinalIgnoreCase))
+        {
+            _items[id] = name;
+            OsrsMr.Core.ItemDatabase.RegisterItem(id, name);
+        }
+    }
+
     public static string ResolveItemName(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return "";
@@ -4062,17 +5196,27 @@ public static class ItemDatabase
         {
             return GetItemName(id);
         }
-        return input;
+        if (input.StartsWith("Item #", StringComparison.OrdinalIgnoreCase) && int.TryParse(input.AsSpan(6), out int parsedId))
+        {
+            var res = GetItemName(parsedId);
+            if (!string.IsNullOrEmpty(res) && res != parsedId.ToString())
+            {
+                return res;
+            }
+        }
+        return OsrsMr.Core.ItemDatabase.ResolveItemName(input);
     }
 
     public static string GetItemName(int id)
     {
-        if (id <= 0) return "";
+        if (id <= 0 || id == 65535) return "";
         if (_items.TryGetValue(id, out var name))
         {
             return name;
         }
-        return id.ToString();
+        var coreName = OsrsMr.Core.ItemDatabase.GetItemName(id);
+        if (!string.IsNullOrEmpty(coreName)) return coreName;
+        return $"Item #{id}";
     }
 
     private static void InitializeStaticItems()
@@ -4564,4 +5708,160 @@ public static class ItemDatabase
         }
         catch { }
     }
+}
+
+public class GrandExchangeOfferUiItem : INotifyPropertyChanged
+{
+    private int _slot;
+    private string _state = "Empty";
+    private int _itemId;
+    private string _itemName = "Empty";
+    private int _price;
+    private int _totalQuantity;
+    private int _quantityTransferred;
+    private int _spent;
+
+    public int Slot
+    {
+        get => _slot;
+        set { _slot = value; OnPropertyChanged(nameof(Slot)); OnPropertyChanged(nameof(SlotHeader)); }
+    }
+
+    public string SlotHeader => $"Slot {Slot + 1}";
+
+    public string State
+    {
+        get => _state;
+        set
+        {
+            _state = value;
+            OnPropertyChanged(nameof(State));
+            OnPropertyChanged(nameof(StatusBgBrush));
+            OnPropertyChanged(nameof(StatusFgBrush));
+        }
+    }
+
+    public int ItemId
+    {
+        get => _itemId;
+        set { _itemId = value; OnPropertyChanged(nameof(ItemId)); }
+    }
+
+    public string ItemName
+    {
+        get => _itemName;
+        set { _itemName = value; OnPropertyChanged(nameof(ItemName)); }
+    }
+
+    public int Price
+    {
+        get => _price;
+        set { _price = value; OnPropertyChanged(nameof(Price)); OnPropertyChanged(nameof(PriceFormatted)); }
+    }
+
+    public string PriceFormatted => $"{Price:N0} gp";
+
+    public int TotalQuantity
+    {
+        get => _totalQuantity;
+        set
+        {
+            _totalQuantity = value;
+            OnPropertyChanged(nameof(TotalQuantity));
+            OnPropertyChanged(nameof(ProgressFormatted));
+            OnPropertyChanged(nameof(ProgressPercentage));
+        }
+    }
+
+    public int QuantityTransferred
+    {
+        get => _quantityTransferred;
+        set
+        {
+            _quantityTransferred = value;
+            OnPropertyChanged(nameof(QuantityTransferred));
+            OnPropertyChanged(nameof(ProgressFormatted));
+            OnPropertyChanged(nameof(ProgressPercentage));
+        }
+    }
+
+    public int Spent
+    {
+        get => _spent;
+        set { _spent = value; OnPropertyChanged(nameof(Spent)); OnPropertyChanged(nameof(SpentFormatted)); }
+    }
+
+    public string SpentFormatted => $"{Spent:N0} gp";
+
+    public string ProgressFormatted => TotalQuantity > 0 ? $"{QuantityTransferred:N0} / {TotalQuantity:N0} ({(double)QuantityTransferred / TotalQuantity * 100:F0}%)" : "0 / 0";
+
+    public double ProgressPercentage => TotalQuantity > 0 ? Math.Min(100.0, (double)QuantityTransferred / TotalQuantity * 100.0) : 0;
+
+    public Brush StatusBgBrush
+    {
+        get
+        {
+            string s = State.ToUpperInvariant();
+            if (s.Contains("BUYING")) return new SolidColorBrush(Color.FromRgb(15, 35, 50));
+            if (s.Contains("BOUGHT") || s.Contains("SOLD")) return new SolidColorBrush(Color.FromRgb(15, 45, 25));
+            if (s.Contains("SELLING")) return new SolidColorBrush(Color.FromRgb(45, 35, 10));
+            if (s.Contains("CANCEL")) return new SolidColorBrush(Color.FromRgb(45, 15, 15));
+            return new SolidColorBrush(Color.FromRgb(30, 30, 35));
+        }
+    }
+
+    public Brush StatusFgBrush
+    {
+        get
+        {
+            string s = State.ToUpperInvariant();
+            if (s.Contains("BUYING")) return new SolidColorBrush(Color.FromRgb(56, 189, 248));
+            if (s.Contains("BOUGHT") || s.Contains("SOLD")) return new SolidColorBrush(Color.FromRgb(52, 211, 153));
+            if (s.Contains("SELLING")) return new SolidColorBrush(Color.FromRgb(251, 191, 36));
+            if (s.Contains("CANCEL")) return new SolidColorBrush(Color.FromRgb(248, 113, 113));
+            return Brushes.Gray;
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
+
+public class RunePouchSlotUiItem : INotifyPropertyChanged
+{
+    private int _slot;
+    private int _runeId;
+    private string _runeName = "None";
+    private int _quantity;
+
+    public int Slot
+    {
+        get => _slot;
+        set { _slot = value; OnPropertyChanged(nameof(Slot)); OnPropertyChanged(nameof(SlotHeader)); }
+    }
+
+    public string SlotHeader => $"Slot {Slot + 1}";
+
+    public int RuneId
+    {
+        get => _runeId;
+        set { _runeId = value; OnPropertyChanged(nameof(RuneId)); }
+    }
+
+    public string RuneName
+    {
+        get => _runeName;
+        set { _runeName = value; OnPropertyChanged(nameof(RuneName)); }
+    }
+
+    public int Quantity
+    {
+        get => _quantity;
+        set { _quantity = value; OnPropertyChanged(nameof(Quantity)); OnPropertyChanged(nameof(QuantityFormatted)); }
+    }
+
+    public string QuantityFormatted => $"{Quantity:N0}";
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }

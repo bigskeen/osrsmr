@@ -118,8 +118,12 @@ namespace OsrsMr.Core
             int colonIdx = line.IndexOf(':');
             if (colonIdx == -1) return;
 
-            string key = line.Substring(0, colonIdx).Trim();
-            string value = line.Substring(colonIdx + 1).Trim();
+            ReadOnlySpan<char> span = line.AsSpan();
+            ReadOnlySpan<char> keySpan = span.Slice(0, colonIdx).Trim();
+            ReadOnlySpan<char> valSpan = span.Slice(colonIdx + 1).Trim();
+
+            string key = keySpan.ToString();
+            string value = valSpan.ToString();
 
             OnRawPacketReceived?.Invoke(key, value);
             PacketDecoder.Decode(State, key, value);

@@ -5,45 +5,142 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.Socket;
-import java.io.OutputStream;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
-import java.util.Collection;
+import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
-import java.util.LinkedHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * High-performance, lightweight RuneLite telemetry agent.
+ * Directly reads live game memory and streams structured telemetry to osrsmr.
+ */
 public class BytecodeAgent {
-    private static final String VERSION = "1.3.4";
+    private static final String VERSION = "1.4.0";
     private static final int PORT = 43594;
     private static volatile Thread heartbeatThread = null;
     private static final String JVM_PID = getPidInternal();
-    private static final ConcurrentHashMap<Integer, String> ITEM_NAME_CACHE = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<Integer, String> OBJECT_NAME_CACHE = new ConcurrentHashMap<>();
 
-    private static String getPidInternal() {
+    // Fast O(1) definition caches
+    private static final ConcurrentHashMap<Integer, String> ITEM_NAME_CACHE = new ConcurrentHashMap<>(1024);
+    private static final ConcurrentHashMap<Integer, String> OBJECT_NAME_CACHE = new ConcurrentHashMap<>(1024);
+    private static final ConcurrentHashMap<Integer, String> NPC_NAME_CACHE = new ConcurrentHashMap<>(512);
+    private static final ConcurrentHashMap<String, Method> METHOD_CACHE = new ConcurrentHashMap<>(256);
+    private static final Method NULL_METHOD_MARKER;
+
+    static {
+        Method dummy = null;
         try {
-            String jvmName = java.lang.management.ManagementFactory.getRuntimeMXBean().getName();
-            int idx = jvmName.indexOf('@');
-            if (idx > 0) return jvmName.substring(0, idx);
-            return jvmName;
-        } catch (Throwable t) {
-            return "Unknown";
+            dummy = Object.class.getMethod("hashCode");
+        } catch (Throwable ignored) {}
+        NULL_METHOD_MARKER = dummy;
+    }
+
+    // Cached Scene Payload for lightweight telemetry
+    private static final StringBuilder cachedSceneData = new StringBuilder(16384);
+    private static volatile long lastSceneScanTime = 0;
+    private static volatile int lastScenePlayerX = -1;
+    private static volatile int lastScenePlayerY = -1;
+    private static volatile int lastScenePlane = -1;
+
+    // Combat tracking state
+    private static volatile String lastCombatTarget = "None";
+    private static volatile int lastCombatTargetIndex = -1;
+    private static volatile int lastCombatTargetLevel = 0;
+    private static volatile String lastCombatTargetHp = "None";
+    private static volatile int lastCombatTargetDistance = 0;
+    private static volatile String lastCombatTargetPrayer = "None";
+    private static volatile String lastCombatTargetWeapon = "None";
+    private static volatile int lastCombatTargetAnim = -1;
+    private static volatile int lastCombatTargetPose = -1;
+    private static final List<String> lastCombatTargetGear = new ArrayList<>(16);
+    private static final int[] lastEnemyEquipIds = new int[14];
+    private static final String[] lastEnemyEquipNames = new String[14];
+    private static final List<String> attackingEnemiesList = new ArrayList<>(16);
+
+    private static final class SceneEntry implements Comparable<SceneEntry> {
+        final int dist;
+        final int id;
+        final String name;
+        final int worldX;
+        final int worldY;
+        final String extra;
+
+        SceneEntry(int dist, int id, String name, int worldX, int worldY, String extra) {
+            this.dist = dist;
+            this.id = id;
+            this.name = name;
+            this.worldX = worldX;
+            this.worldY = worldY;
+            this.extra = extra;
+        }
+
+        @Override
+        public int compareTo(SceneEntry o) {
+            return Integer.compare(this.dist, o.dist);
         }
     }
-    
-    // RuneLite API / Instance Cache
+
+    private static final List<SceneEntry> treeEntries = new ArrayList<>(64);
+    private static final List<SceneEntry> bankEntries = new ArrayList<>(32);
+    private static final List<SceneEntry> shopEntries = new ArrayList<>(32);
+    private static final List<SceneEntry> altarEntries = new ArrayList<>(32);
+    private static final List<SceneEntry> rockEntries = new ArrayList<>(64);
+    private static final List<SceneEntry> shortcutEntries = new ArrayList<>(32);
+    private static final List<SceneEntry> obstacleEntries = new ArrayList<>(32);
+    private static final List<SceneEntry> groundItemEntries = new ArrayList<>(64);
+
+    private static final java.util.Set<Integer> KNOWN_BANK_OBJECT_IDS = new java.util.HashSet<>(Arrays.asList(
+        10083, 10355, 10356, 10357, 10517, 10562, 10583, 10584, 11744, 11748, 12308, 14367, 16642,
+        18491, 19051, 20325, 22819, 24101, 24347, 25808, 26707, 26711, 27266, 27267, 27268, 27292,
+        28430, 28431, 28432, 28433, 28546, 28547, 28548, 28549, 29085, 30089, 31427, 34752, 36559,
+        36786, 39239, 42847, 44464, 4483, 6943, 7407, 7408
+    ));
+
+    // RuneLite Hook Cache
     private static volatile Object runeLiteClient = null;
-    private static volatile Object runeLiteInjector = null;
     private static volatile Object runeLiteItemManager = null;
 
     private static final String[] SKILL_NAMES = {
         "Attack", "Defence", "Strength", "Hitpoints", "Ranged", "Prayer", "Magic", "Cooking",
         "Woodcutting", "Fletching", "Fishing", "Firemaking", "Crafting", "Smithing", "Mining",
         "Herblore", "Agility", "Thieving", "Slayer", "Farming", "Runecraft", "Hunter", "Construction", "Sailing"
+    };
+
+    private static final Object[][] STANDARD_PRAYERS_MAP = {
+        {"Thick Skin", "THICK_SKIN", 4104},
+        {"Burst of Strength", "BURST_OF_STRENGTH", 4105},
+        {"Clarity of Thought", "CLARITY_OF_THOUGHT", 4106},
+        {"Sharp Eye", "SHARP_EYE", 4122},
+        {"Mystic Will", "MYSTIC_WILL", 4123},
+        {"Rock Skin", "ROCK_SKIN", 4107},
+        {"Superhuman Strength", "SUPERHUMAN_STRENGTH", 4108},
+        {"Improved Reflexes", "IMPROVED_REFLEXES", 4109},
+        {"Rapid Restore", "RAPID_RESTORE", 4110},
+        {"Rapid Heal", "RAPID_HEAL", 4111},
+        {"Protect Item", "PROTECT_ITEM", 4112},
+        {"Hawk Eye", "HAWK_EYE", 4124},
+        {"Mystic Lore", "MYSTIC_LORE", 4125},
+        {"Steel Skin", "STEEL_SKIN", 4113},
+        {"Ultimate Strength", "ULTIMATE_STRENGTH", 4114},
+        {"Incredible Reflexes", "INCREDIBLE_REFLEXES", 4115},
+        {"Protect from Magic", "PROTECT_FROM_MAGIC", 4116},
+        {"Protect from Missiles", "PROTECT_FROM_MISSILES", 4117},
+        {"Protect from Melee", "PROTECT_FROM_MELEE", 4118},
+        {"Eagle Eye", "EAGLE_EYE", 4126},
+        {"Mystic Might", "MYSTIC_MIGHT", 4127},
+        {"Retribution", "RETRIBUTION", 4119},
+        {"Redemption", "REDEMPTION", 4120},
+        {"Smite", "SMITE", 4121},
+        {"Preserve", "PRESERVE", 5466},
+        {"Chivalry", "CHIVALRY", 4128},
+        {"Piety", "PIETY", 4129},
+        {"Rigour", "RIGOUR", 5464},
+        {"Augury", "AUGURY", 5465}
     };
 
     public static void premain(String agentArgs, Instrumentation inst) {
@@ -56,37 +153,27 @@ public class BytecodeAgent {
 
     private static synchronized void initialize(Instrumentation inst) {
         String sunJavaCmd = System.getProperty("sun.java.command", "");
-        if (sunJavaCmd.contains("com.osrsmr.attach.AttachHelper")) {
-            return;
-        }
-
-        if (heartbeatThread != null && heartbeatThread.isAlive()) {
-            System.out.println("[osrsmr] Agent already active and running (PID " + JVM_PID + ")");
-            return;
-        }
+        if (sunJavaCmd.contains("com.osrsmr.attach.AttachHelper")) return;
+        if (heartbeatThread != null && heartbeatThread.isAlive()) return;
 
         heartbeatThread = new Thread(() -> {
             try {
-                // Wait briefly for client initialization
-                Thread.sleep(500);
-                System.out.println("[osrsmr] Starting Discovery Agent v" + VERSION + " (PID " + JVM_PID + ")...");
-
+                Thread.sleep(300);
                 Socket socket = null;
-                OutputStream out = null;
+                BufferedWriter writer = null;
+                StringBuilder data = new StringBuilder(16384);
 
                 while (true) {
                     try {
-                        // 1. Scan loaded classes for RuneLite client
-                        try {
+                        if (runeLiteClient == null || runeLiteItemManager == null) {
                             scanAndDiscover(inst);
-                        } catch (Throwable ignored) {}
+                        }
 
-                        // Establish / maintain TCP socket to Bridge only when RuneLite Client is discovered
                         if (runeLiteClient == null) {
                             if (socket != null) {
                                 try { socket.close(); } catch (Exception ignored) {}
                                 socket = null;
-                                out = null;
+                                writer = null;
                             }
                             Thread.sleep(500);
                             continue;
@@ -97,2759 +184,695 @@ public class BytecodeAgent {
                                 socket = new Socket("127.0.0.1", PORT);
                                 socket.setTcpNoDelay(true);
                                 socket.setSendBufferSize(65536);
-                                out = socket.getOutputStream();
-                                System.out.println("[osrsmr] Connected to Bridge on port " + PORT + " (PID " + JVM_PID + ")");
+                                writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), 16384);
                             } catch (Exception e) {
-                                // Bridge not listening yet
-                                Thread.sleep(1000);
+                                Thread.sleep(800);
                                 continue;
                             }
                         }
 
-                        StringBuilder data = new StringBuilder();
+                        data.setLength(0);
                         data.append("PID: ").append(JVM_PID).append("\n");
                         data.append("Status: Hook Active (v").append(VERSION).append(")\n");
 
-                        // 2. RuneLite API Extraction
-                        try {
-                            processRuneLiteClient(runeLiteClient, data);
-                        } catch (Throwable t) {
-                            // Do not discard runeLiteClient on transient extraction error
-                        }
+                        processRuneLiteClient(runeLiteClient, data);
 
-                        // Send data over socket
-                        try {
-                            byte[] bytes = data.toString().getBytes(StandardCharsets.UTF_8);
-                            out.write(bytes);
-                            out.flush();
-                        } catch (Exception ioEx) {
-                            // Network I/O failure (socket closed or broken)
-                            if (socket != null) {
-                                try { socket.close(); } catch (Exception ignored) {}
-                                socket = null;
-                                out = null;
-                            }
+                        if (writer != null) {
+                            writer.append(data);
+                            writer.flush();
                         }
                     } catch (Throwable t) {
-                        // Keep agent loop alive
+                        if (socket != null) {
+                            try { socket.close(); } catch (Exception ignored) {}
+                            socket = null;
+                            writer = null;
+                        }
                     }
-                    Thread.sleep(400);
+                    Thread.sleep(20);
                 }
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }, "osrsmr-heartbeat");
+            } catch (Exception ignored) {}
+        }, "RuneLite-Telemetry-Worker");
+
         heartbeatThread.setDaemon(true);
+        heartbeatThread.setPriority(Thread.NORM_PRIORITY - 1);
         heartbeatThread.start();
     }
 
-    private static void scanAndDiscover(Instrumentation inst) {
-        if ((runeLiteClient != null && runeLiteItemManager != null) || inst == null) {
-            return;
+    private static String getPidInternal() {
+        try {
+            String jvmName = java.lang.management.ManagementFactory.getRuntimeMXBean().getName();
+            int idx = jvmName.indexOf('@');
+            return idx > 0 ? jvmName.substring(0, idx) : jvmName;
+        } catch (Throwable t) {
+            return "Unknown";
         }
+    }
+
+    private static volatile long lastScanTimeMillis = 0;
+
+    private static void scanAndDiscover(Instrumentation inst) {
+        if ((runeLiteClient != null && runeLiteItemManager != null) || inst == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastScanTimeMillis < 500) return;
+        lastScanTimeMillis = now;
+
         try {
             Class<?>[] allLoaded = inst.getAllLoadedClasses();
 
-            // Try to find RuneLite Client instance
-            if (runeLiteClient == null || runeLiteItemManager == null) {
-                // Method 1: Check RuneLite injector & static fields
-                for (Class<?> clazz : allLoaded) {
-                    String cName = clazz.getName();
-                    if (cName.equals("net.runelite.client.RuneLite")) {
-                        try {
-                            Object injector = null;
-                            // Try getInjector()
-                            try {
-                                Method getInjector = clazz.getDeclaredMethod("getInjector");
-                                getInjector.setAccessible(true);
-                                injector = getInjector.invoke(null);
-                            } catch (Throwable ignored) {}
-
-                            // Try injector field
-                            if (injector == null) {
-                                for (Field f : clazz.getDeclaredFields()) {
-                                    if (f.getName().equals("injector") || f.getType().getName().contains("Injector")) {
-                                        f.setAccessible(true);
-                                        injector = f.get(null);
-                                        if (injector != null) break;
-                                    }
-                                }
-                            }
-
-                            if (injector != null) {
-                                runeLiteInjector = injector;
-
-                                // Acquire ItemManager from Injector
-                                if (runeLiteItemManager == null) {
-                                    try {
-                                        Class<?> itemMgrClass = null;
-                                        try {
-                                            itemMgrClass = Class.forName("net.runelite.client.game.ItemManager", false, clazz.getClassLoader());
-                                        } catch (Throwable ignored) {}
-                                        if (itemMgrClass == null) {
-                                            for (Class<?> c : allLoaded) {
-                                                if (c.getName().equals("net.runelite.client.game.ItemManager")) {
-                                                    itemMgrClass = c;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if (itemMgrClass != null) {
-                                            for (Method m : injector.getClass().getMethods()) {
-                                                if (m.getName().equals("getInstance") && m.getParameterCount() == 1 && m.getParameterTypes()[0] == Class.class) {
-                                                    try {
-                                                        m.setAccessible(true);
-                                                        Object mgr = m.invoke(injector, itemMgrClass);
-                                                        if (mgr != null) {
-                                                            runeLiteItemManager = mgr;
-                                                            System.out.println("[osrsmr] RuneLite ItemManager acquired via Injector.getInstance(ItemManager.class)");
-                                                            break;
-                                                        }
-                                                    } catch (Throwable ignored) {}
-                                                }
-                                            }
-                                        }
-                                    } catch (Throwable ignored) {}
-                                }
-
-                                Class<?> clientClass = null;
-                                try {
-                                    clientClass = Class.forName("net.runelite.api.Client", false, clazz.getClassLoader());
-                                } catch (Throwable ignored) {}
-
-                                if (clientClass == null) {
-                                    for (Class<?> c : allLoaded) {
-                                        if (c.getName().equals("net.runelite.api.Client")) {
-                                            clientClass = c;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if (clientClass != null) {
-                                    for (Method m : injector.getClass().getMethods()) {
-                                        if (m.getName().equals("getInstance") && m.getParameterCount() == 1 && m.getParameterTypes()[0] == Class.class) {
-                                            try {
-                                                m.setAccessible(true);
-                                                Object instance = m.invoke(injector, clientClass);
-                                                if (instance != null) {
-                                                    runeLiteClient = instance;
-                                                    System.out.println("[osrsmr] RuneLite Client acquired via Injector.getInstance(Client.class)");
-                                                    break;
-                                                }
-                                            } catch (Throwable ignored) {}
-                                        }
-                                    }
-                                }
-
-                                if (runeLiteClient == null || runeLiteItemManager == null) {
-                                    try {
-                                        Method getAllBindings = injector.getClass().getMethod("getAllBindings");
-                                        getAllBindings.setAccessible(true);
-                                        Map<?, ?> map = (Map<?, ?>) getAllBindings.invoke(injector);
-                                        if (map != null) {
-                                            for (Map.Entry<?, ?> entry : map.entrySet()) {
-                                                String keyStr = String.valueOf(entry.getKey());
-                                                if (runeLiteClient == null && (keyStr.contains("net.runelite.api.Client") || keyStr.contains("RSClient"))) {
-                                                    try {
-                                                        Object binding = entry.getValue();
-                                                        Method getProvider = binding.getClass().getMethod("getProvider");
-                                                        getProvider.setAccessible(true);
-                                                        Object provider = getProvider.invoke(binding);
-                                                        if (provider != null) {
-                                                            Method get = provider.getClass().getMethod("get");
-                                                            get.setAccessible(true);
-                                                            Object val = get.invoke(provider);
-                                                            if (val != null && isRuneLiteClientObject(val)) {
-                                                                runeLiteClient = val;
-                                                                System.out.println("[osrsmr] RuneLite Client acquired via Injector binding " + keyStr);
-                                                            }
-                                                        }
-                                                    } catch (Throwable ignored) {}
-                                                }
-                                                if (runeLiteItemManager == null && keyStr.contains("ItemManager")) {
-                                                    try {
-                                                        Object binding = entry.getValue();
-                                                        Method getProvider = binding.getClass().getMethod("getProvider");
-                                                        getProvider.setAccessible(true);
-                                                        Object provider = getProvider.invoke(binding);
-                                                        if (provider != null) {
-                                                            Method get = provider.getClass().getMethod("get");
-                                                            get.setAccessible(true);
-                                                            Object val = get.invoke(provider);
-                                                            if (val != null) {
-                                                                runeLiteItemManager = val;
-                                                                System.out.println("[osrsmr] RuneLite ItemManager acquired via Injector binding " + keyStr);
-                                                            }
-                                                        }
-                                                    } catch (Throwable ignored) {}
-                                                }
-                                            }
-                                        }
-                                    } catch (Throwable ignored) {}
-                                }
-                            }
-                        } catch (Throwable t) {
-                            t.printStackTrace();
-                        }
-                    }
-                    if (runeLiteClient != null && runeLiteItemManager != null) break;
-                }
-
-                // Method 2: Check static fields & singleton objects in all loaded classes
-                if (runeLiteClient == null || runeLiteItemManager == null) {
-                    for (Class<?> clazz : allLoaded) {
-                        Field[] fields;
-                        try {
-                            fields = clazz.getDeclaredFields();
-                        } catch (Throwable t) { continue; }
-
-                        for (Field f : fields) {
-                            if (Modifier.isStatic(f.getModifiers()) && !f.getType().isPrimitive()) {
-                                try {
-                                    f.setAccessible(true);
-                                    Object val = f.get(null);
-                                    if (val == null) continue;
-
-                                    if (runeLiteClient == null && isRuneLiteClientObject(val)) {
-                                        runeLiteClient = val;
-                                        System.out.println("[osrsmr] RuneLite Client instance discovered in " + clazz.getName() + "." + f.getName());
-                                    }
-
-                                    // Check fields of singleton / manager objects
-                                    String typeName = val.getClass().getName();
-                                    if (typeName.startsWith("net.runelite.") || typeName.equals("client") || typeName.contains("ClientLoader")) {
-                                        for (Field innerF : val.getClass().getDeclaredFields()) {
-                                            if (!innerF.getType().isPrimitive()) {
-                                                innerF.setAccessible(true);
-                                                Object innerVal = innerF.get(val);
-                                                if (runeLiteClient == null && innerVal != null && isRuneLiteClientObject(innerVal)) {
-                                                    runeLiteClient = innerVal;
-                                                    System.out.println("[osrsmr] RuneLite Client discovered in " + typeName + "." + innerF.getName());
-                                                }
-                                                if (runeLiteItemManager == null && innerVal != null && innerVal.getClass().getName().contains("ItemManager")) {
-                                                    runeLiteItemManager = innerVal;
-                                                    System.out.println("[osrsmr] RuneLite ItemManager discovered in " + typeName + "." + innerF.getName());
-                                                }
-                                            }
-                                        }
-                                    }
-                                } catch (Throwable ignored) {}
-                            }
-                        }
-                        if (runeLiteClient != null && runeLiteItemManager != null) break;
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            t.printStackTrace();
-        }
-    }
-
-    private static boolean isRuneLiteClientObject(Object obj) {
-        if (obj == null) return false;
-        Class<?> cls = obj.getClass();
-        String cName = cls.getName();
-
-        // Exclude UI and auxiliary components
-        if (cName.startsWith("net.runelite.client.ui.")
-                || cName.startsWith("net.runelite.client.plugins.")
-                || cName.startsWith("net.runelite.client.config.")
-                || cName.startsWith("net.runelite.client.chat.")
-                || cName.startsWith("net.runelite.client.task.")
-                || cName.startsWith("net.runelite.client.util.")
-                || cName.startsWith("net.runelite.client.menus.")
-                || cName.startsWith("net.runelite.client.discord.")
-                || cName.startsWith("net.runelite.client.ws.")
-                || cName.startsWith("net.runelite.client.events.")
-                || cName.equals("net.runelite.client.RuneLite")
-                || cName.contains("SessionManager")
-                || cName.contains("Toolbar")
-                || cName.contains("Panel")
-                || cName.contains("Loader")
-                || cName.contains("Thread")
-                || cName.contains("Manager")
-                || cName.contains("Injector")) {
-            return false;
-        }
-
-        // Direct class or interface matching
-        if (cName.equals("client") || cName.equals("net.runelite.client.Client")
-                || cName.equals("net.runelite.api.Client") || cName.equals("net.runelite.rs.api.RSClient")) {
-            return true;
-        }
-
-        for (Class<?> iface : cls.getInterfaces()) {
-            String iName = iface.getName();
-            if (iName.equals("net.runelite.api.Client") || iName.equals("net.runelite.rs.api.RSClient") || iName.equals("client")) {
-                return true;
-            }
-        }
-
-        Class<?> curr = cls.getSuperclass();
-        while (curr != null && curr != Object.class) {
-            String sName = curr.getName();
-            if (sName.equals("client") || sName.equals("net.runelite.rs.api.RSClient") || sName.equals("net.runelite.api.Client")) {
-                return true;
-            }
-            for (Class<?> iface : curr.getInterfaces()) {
-                String iName = iface.getName();
-                if (iName.equals("net.runelite.api.Client") || iName.equals("net.runelite.rs.api.RSClient")) {
-                    return true;
-                }
-            }
-            curr = curr.getSuperclass();
-        }
-
-        // Method-based validation: Must have getGameState() AND one core client method
-        try {
-            Method m1 = cls.getMethod("getGameState");
-            if (m1 != null) {
-                for (String mName : new String[]{"getLocalPlayer", "getCanvas", "getTopLevelWorldView", "getItemContainer", "getPlane"}) {
+            for (Class<?> clazz : allLoaded) {
+                if ("net.runelite.client.RuneLite".equals(clazz.getName())) {
                     try {
-                        Method m2 = cls.getMethod(mName);
-                        if (m2 != null) return true;
+                        Object injector = null;
+                        Method getInjector = findMethod(clazz, "getInjector");
+                        if (getInjector != null) {
+                            injector = getInjector.invoke(null);
+                        }
+
+                        if (injector != null) {
+                            // Discover Client
+                            for (Class<?> c : allLoaded) {
+                                if ("net.runelite.api.Client".equals(c.getName())) {
+                                    Method getInstance = findMethod(injector.getClass(), "getInstance", Class.class);
+                                    if (getInstance != null) {
+                                        runeLiteClient = getInstance.invoke(injector, c);
+                                        break;
+                                    }
+                                }
+                            }
+                            // Discover ItemManager
+                            for (Class<?> c : allLoaded) {
+                                if ("net.runelite.client.game.ItemManager".equals(c.getName())) {
+                                    Method getInstance = findMethod(injector.getClass(), "getInstance", Class.class);
+                                    if (getInstance != null) {
+                                        runeLiteItemManager = getInstance.invoke(injector, c);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     } catch (Throwable ignored) {}
                 }
+                if (runeLiteClient != null && runeLiteItemManager != null) break;
             }
         } catch (Throwable ignored) {}
-
-        return false;
     }
 
-    private static boolean processRuneLiteClient(Object client, StringBuilder data) {
+    private static void processRuneLiteClient(Object client, StringBuilder data) {
         try {
             data.append("Client Class: RuneLite-Injected\n");
 
-            // GameState
+            // 1. GameState
             int gs = 0;
             String stateStr = "Unknown";
-            try {
-                Method getGameStateMethod = client.getClass().getMethod("getGameState");
-                getGameStateMethod.setAccessible(true);
-                Object gsObj = getGameStateMethod.invoke(client);
-                if (gsObj != null) {
-                    if (gsObj instanceof Number) {
-                        gs = ((Number) gsObj).intValue();
-                    } else if (gsObj instanceof Enum) {
-                        Enum<?> gsEnum = (Enum<?>) gsObj;
-                        String name = gsEnum.name();
-                        try {
-                            Method getStateMethod = gsObj.getClass().getMethod("getState");
-                            getStateMethod.setAccessible(true);
-                            gs = (Integer) getStateMethod.invoke(gsObj);
-                        } catch (Throwable t) {
-                            if ("LOGGED_IN".equalsIgnoreCase(name)) gs = 30;
-                            else if ("LOGIN_SCREEN".equalsIgnoreCase(name)) gs = 10;
-                            else if ("LOGIN_SCREEN_AUTHENTICATOR".equalsIgnoreCase(name)) gs = 11;
-                            else if ("LOGGING_IN".equalsIgnoreCase(name)) gs = 20;
-                            else if ("LOADING".equalsIgnoreCase(name)) gs = 25;
-                            else if ("HOPPING".equalsIgnoreCase(name)) gs = 45;
-                            else if ("CONNECTION_LOST".equalsIgnoreCase(name)) gs = 40;
-                            else if ("STARTING".equalsIgnoreCase(name)) gs = 1;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
+            Object gsObj = invokeMethodQuietly(client, "getGameState");
+            if (gsObj instanceof Number) {
+                gs = ((Number) gsObj).intValue();
+            } else if (gsObj instanceof Enum) {
+                String enumName = ((Enum<?>) gsObj).name();
+                if ("LOGGED_IN".equalsIgnoreCase(enumName)) gs = 30;
+                else if ("LOGIN_SCREEN".equalsIgnoreCase(enumName)) gs = 10;
+                else if ("LOADING".equalsIgnoreCase(enumName)) gs = 25;
+                else if ("HOPPING".equalsIgnoreCase(enumName)) gs = 45;
+                else if ("CONNECTION_LOST".equalsIgnoreCase(enumName)) gs = 40;
+            }
 
-            // LocalPlayer
-            Object player = null;
-            try {
-                Method getLocalPlayerMethod = client.getClass().getMethod("getLocalPlayer");
-                getLocalPlayerMethod.setAccessible(true);
-                player = getLocalPlayerMethod.invoke(client);
-            } catch (Throwable ignored) {}
+            Object player = invokeMethodQuietly(client, "getLocalPlayer");
             if (player == null) {
-                try {
-                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
-                    getTopView.setAccessible(true);
-                    Object topView = getTopView.invoke(client);
-                    if (topView != null) {
-                        Method getLocalPlayer = topView.getClass().getMethod("getLocalPlayer");
-                        getLocalPlayer.setAccessible(true);
-                        player = getLocalPlayer.invoke(topView);
-                    }
-                } catch (Throwable ignored) {}
-            }
-
-            // Infer Logged In if player exists
-            if (player != null) {
-                if (gs == 0 || gs == 20 || gs == 25) {
-                    gs = 30;
+                Object topView = invokeMethodQuietly(client, "getTopLevelWorldView");
+                if (topView != null) {
+                    player = invokeMethodQuietly(topView, "getLocalPlayer");
                 }
             }
+            if (player != null && gs == 0) gs = 30;
 
             if (gs == 30) stateStr = "Logged In";
-            else if (gs == 10 || gs == 11) stateStr = "Login Screen";
-            else if (gs == 20) stateStr = "Logging In";
+            else if (gs == 10) stateStr = "Login Screen";
             else if (gs == 25) stateStr = "Loading";
             else if (gs == 45) stateStr = "Hopping";
             else if (gs == 40) stateStr = "Connection Lost";
-            else if (gs == 1) stateStr = "Starting";
             else stateStr = "Detecting...";
 
             data.append("GameState: ").append(gs).append("\n");
             data.append("ENGINE_STATE: ").append(stateStr).append("\n");
 
             // World
-            try {
-                Method getWorld = client.getClass().getMethod("getWorld");
-                getWorld.setAccessible(true);
-                int world = (Integer) getWorld.invoke(client);
+            Object wObj = invokeMethodQuietly(client, "getWorld");
+            if (wObj instanceof Integer) {
+                int world = (Integer) wObj;
                 if (world > 0) {
                     if (world < 300) world += 300;
                     data.append("WORLD: ").append(world).append("\n");
                 }
-            } catch (Throwable ignored) {}
-
-            // When player is not yet in-game, do not emit uninitialized zeroes/containers
-            if (gs != 30 && player == null) {
-                return true;
             }
 
-            // Player Data
+            if (gs != 30 && player == null) return;
+
+            // 2. Local Player Location & State
             int playerX = 0, playerY = 0, plane = 0;
+            String localPlayerName = "";
+            String interactingName = "None";
+            String interactingType = "None";
+            int interactingId = -1;
+
+            boolean isInstanced = false;
+            try {
+                Object instObj = invokeMethodQuietly(client, "isInInstancedRegion");
+                if (instObj instanceof Boolean) {
+                    isInstanced = (Boolean) instObj;
+                }
+                if (!isInstanced) {
+                    Object topView = invokeMethodQuietly(client, "getTopLevelWorldView");
+                    if (topView != null) {
+                        Object wvInst = invokeMethodQuietly(topView, "isInInstance");
+                        if (wvInst instanceof Boolean) isInstanced = (Boolean) wvInst;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            data.append("IS_INSTANCED: ").append(isInstanced ? "True" : "False").append("\n");
+            data.append("IN_INSTANCE: ").append(isInstanced ? "True" : "False").append("\n");
+
+            // Game Tick & Cycle (read early for tick-perfect synchronization)
+            Object tick = invokeMethodQuietly(client, "getTickCount");
+            if (tick instanceof Integer) {
+                data.append("GAME_TICK: ").append(tick).append("\n");
+            }
+            Object cycle = invokeMethodQuietly(client, "getGameCycle");
+            if (cycle instanceof Integer) {
+                data.append("GAME_CYCLE: ").append(cycle).append("\n");
+            } else if (tick instanceof Integer) {
+                data.append("GAME_CYCLE: ").append(tick).append("\n");
+            }
+
             if (player != null) {
-                try {
-                    Method getName = player.getClass().getMethod("getName");
-                    getName.setAccessible(true);
-                    String pName = (String) getName.invoke(player);
-                    if (pName != null && !pName.isEmpty()) {
-                        data.append("PLAYER_NAME: ").append(pName).append("\n");
+                Object nameObj = invokeMethodQuietly(player, "getName");
+                if (nameObj instanceof String) {
+                    localPlayerName = ((String) nameObj).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
+                    if (!localPlayerName.isEmpty()) {
+                        data.append("PLAYER_NAME: ").append(localPlayerName).append("\n");
                     }
-                } catch (Throwable ignored) {}
+                }
 
-                try {
-                    Method getWorldLocation = player.getClass().getMethod("getWorldLocation");
-                    getWorldLocation.setAccessible(true);
-                    Object wp = getWorldLocation.invoke(player);
-                    if (wp != null) {
-                        Method getX = wp.getClass().getMethod("getX");
-                        Method getY = wp.getClass().getMethod("getY");
-                        Method getPlane = wp.getClass().getMethod("getPlane");
-                        getX.setAccessible(true);
-                        getY.setAccessible(true);
-                        getPlane.setAccessible(true);
-                        playerX = (Integer) getX.invoke(wp);
-                        playerY = (Integer) getY.invoke(wp);
-                        plane = (Integer) getPlane.invoke(wp);
-                    }
-                } catch (Throwable ignored) {}
-
-                if (playerX == 0 || playerY == 0) {
-                    try {
-                        Method getLocalLocation = player.getClass().getMethod("getLocalLocation");
-                        getLocalLocation.setAccessible(true);
-                        Object lp = getLocalLocation.invoke(player);
-                        if (lp != null) {
-                            Method getX = lp.getClass().getMethod("getX");
-                            Method getY = lp.getClass().getMethod("getY");
-                            getX.setAccessible(true);
-                            getY.setAccessible(true);
-                            int lpX = (Integer) getX.invoke(lp);
-                            int lpY = (Integer) getY.invoke(lp);
-
-                            int baseX = 0, baseY = 0;
-                            try {
-                                Method getBaseX = client.getClass().getMethod("getBaseX");
-                                Method getBaseY = client.getClass().getMethod("getBaseY");
-                                getBaseX.setAccessible(true);
-                                getBaseY.setAccessible(true);
-                                baseX = (Integer) getBaseX.invoke(client);
-                                baseY = (Integer) getBaseY.invoke(client);
-                            } catch (Throwable ignored) {}
-
-                            if (baseX == 0 || baseY == 0) {
-                                try {
-                                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
-                                    getTopView.setAccessible(true);
-                                    Object topView = getTopView.invoke(client);
-                                    if (topView != null) {
-                                        Method getBaseX = topView.getClass().getMethod("getBaseX");
-                                        Method getBaseY = topView.getClass().getMethod("getBaseY");
-                                        getBaseX.setAccessible(true);
-                                        getBaseY.setAccessible(true);
-                                        baseX = (Integer) getBaseX.invoke(topView);
-                                        baseY = (Integer) getBaseY.invoke(topView);
-                                    }
-                                } catch (Throwable ignored) {}
-                            }
-
-                            if (baseX > 0 && baseY > 0) {
-                                playerX = baseX + (lpX >> 7);
-                                playerY = baseY + (lpY >> 7);
-                            }
-                        }
-                    } catch (Throwable ignored) {}
+                Object wp = invokeMethodQuietly(player, "getWorldLocation");
+                if (wp != null) {
+                    Object gx = invokeMethodQuietly(wp, "getX");
+                    Object gy = invokeMethodQuietly(wp, "getY");
+                    Object gp = invokeMethodQuietly(wp, "getPlane");
+                    if (gx instanceof Integer) playerX = (Integer) gx;
+                    if (gy instanceof Integer) playerY = (Integer) gy;
+                    if (gp instanceof Integer) plane = (Integer) gp;
                 }
 
                 if (playerX > 0 && playerY > 0) {
+                    int regionId = ((playerX >> 6) << 8) | (playerY >> 6);
+                    String locationName = resolveLocationName(playerX, playerY, plane, regionId);
                     data.append("PLAYER_X: ").append(playerX).append("\n");
                     data.append("PLAYER_Y: ").append(playerY).append("\n");
-                    data.append("LOCATION: (").append(playerX).append(", ").append(playerY).append(", ").append(plane).append(")\n");
-                    data.append("LOCATION_STATUS: Connected\n");
+                    data.append("PLANE: ").append(plane).append("\n");
+                    data.append("REGION_ID: ").append(regionId).append("\n");
+                    data.append("LOCATION: ").append(locationName).append("\n");
+                    data.append("LOCATION_NAME: ").append(locationName).append("\n");
+                    data.append("TOWN: ").append(locationName).append("\n");
+                    data.append("WORLD_LOCATION: ").append(playerX).append(",").append(playerY).append(",").append(plane).append("\n");
                 }
 
-                try {
-                    Method getAnimation = player.getClass().getMethod("getAnimation");
-                    getAnimation.setAccessible(true);
-                    int anim = (Integer) getAnimation.invoke(player);
-                    data.append("ANIMATION: ").append(anim).append("\n");
-                } catch (Throwable ignored) {}
+                Object animObj = invokeMethodQuietly(player, "getAnimation");
+                if (animObj instanceof Integer) data.append("ANIMATION: ").append(animObj).append("\n");
 
-                try {
-                    Method getOrientation = player.getClass().getMethod("getOrientation");
-                    getOrientation.setAccessible(true);
-                    int orient = (Integer) getOrientation.invoke(player);
-                    data.append("ORIENTATION: ").append(orient).append("\n");
-                } catch (Throwable ignored) {}
+                Object poseAnimObj = invokeMethodQuietly(player, "getPoseAnimation");
+                if (poseAnimObj instanceof Integer) data.append("POSE_ANIMATION: ").append(poseAnimObj).append("\n");
 
-                try {
-                    Method getCombatLevel = player.getClass().getMethod("getCombatLevel");
-                    getCombatLevel.setAccessible(true);
-                    int combat = (Integer) getCombatLevel.invoke(player);
-                    if (combat > 0) {
-                        data.append("COMBAT_LEVEL: ").append(combat).append("\n");
-                    }
-                } catch (Throwable ignored) {}
-            }
+                Object orientObj = invokeMethodQuietly(player, "getOrientation");
+                if (orientObj instanceof Integer) data.append("ORIENTATION: ").append(orientObj).append("\n");
 
-            // Skills Data
-            int[] realLevels = null;
-            int[] boostedLevels = null;
-            try {
-                Method getRealSkills = client.getClass().getMethod("getRealSkillLevels");
-                getRealSkills.setAccessible(true);
-                realLevels = (int[]) getRealSkills.invoke(client);
-            } catch (Throwable ignored) {}
+                Object cbObj = invokeMethodQuietly(player, "getCombatLevel");
+                if (cbObj instanceof Integer) data.append("COMBAT_LEVEL: ").append(cbObj).append("\n");
 
-            try {
-                Method getBoosted = client.getClass().getMethod("getBoostedSkillLevels");
-                getBoosted.setAccessible(true);
-                boostedLevels = (int[]) getBoosted.invoke(client);
-            } catch (Throwable ignored) {}
+                // Target / Interacting Actor
+                Object target = invokeMethodQuietly(player, "getInteracting");
+                if (target != null) {
+                    String clName = target.getClass().getName().toLowerCase();
+                    boolean isNpc = clName.contains("npc");
+                    boolean isPlr = clName.contains("player");
+                    Object idObj = invokeMethodQuietly(target, "getId");
+                    if (idObj instanceof Integer) interactingId = (Integer) idObj;
 
-            if (realLevels != null) {
-                for (int i = 0; i < Math.min(realLevels.length, SKILL_NAMES.length); i++) {
-                    int real = realLevels[i];
-                    if (boostedLevels != null && i < boostedLevels.length) {
-                        int boosted = boostedLevels[i];
-                        data.append("SKILL[").append(SKILL_NAMES[i]).append("]: ").append(boosted).append("/").append(real).append("\n");
+                    if (isNpc) {
+                        interactingType = "NPC";
+                        interactingName = extractNpcName(client, target, interactingId);
+                    } else if (isPlr) {
+                        interactingType = "Player";
+                        Object pn = invokeMethodQuietly(target, "getName");
+                        if (pn instanceof String) interactingName = cleanName((String) pn);
                     } else {
-                        data.append("SKILL[").append(SKILL_NAMES[i]).append("]: ").append(real).append("\n");
+                        interactingName = extractNpcName(client, target, interactingId);
                     }
                 }
+
+                data.append("INTERACTING: ").append(interactingName).append("\n");
+                data.append("INTERACTING_TYPE: ").append(interactingType).append("\n");
+                data.append("INTERACTING_ID: ").append(interactingId).append("\n");
+            }
+
+            // 3. Skills
+            Object rLevelsObj = invokeMethodQuietly(client, "getRealSkillLevels");
+            Object bLevelsObj = invokeMethodQuietly(client, "getBoostedSkillLevels");
+            Object xpObj = invokeMethodQuietly(client, "getSkillExperiences");
+
+            if (rLevelsObj instanceof int[] && bLevelsObj instanceof int[]) {
+                int[] rLevels = (int[]) rLevelsObj;
+                int[] bLevels = (int[]) bLevelsObj;
+                int[] exps = (xpObj instanceof int[]) ? (int[]) xpObj : null;
+
+                for (int i = 0; i < Math.min(rLevels.length, SKILL_NAMES.length); i++) {
+                    int real = rLevels[i];
+                    int boosted = (i < bLevels.length) ? bLevels[i] : real;
+                    data.append("SKILL[").append(SKILL_NAMES[i]).append("]: ").append(boosted).append("/").append(real).append("\n");
+
+                    if (exps != null && i < exps.length) {
+                        data.append("SKILL_XP[").append(SKILL_NAMES[i]).append("]: ").append(exps[i]).append("\n");
+                    }
+
+                    if ("Hitpoints".equalsIgnoreCase(SKILL_NAMES[i])) {
+                        data.append("HP: ").append(boosted).append("/").append(real).append("\n");
+                    } else if ("Prayer".equalsIgnoreCase(SKILL_NAMES[i])) {
+                        data.append("PRAYER: ").append(boosted).append("/").append(real).append("\n");
+                    }
+                }
+            }
+
+            // 4. Energy & Weight
+            Object energyObj = invokeMethodQuietly(client, "getEnergy");
+            if (energyObj instanceof Integer) {
+                int energy = ((Integer) energyObj) / 100;
+                data.append("RUN_ENERGY: ").append(energy).append("\n");
+                data.append("ENERGY: ").append(energy).append("\n");
+            }
+
+            Object weightObj = invokeMethodQuietly(client, "getWeight");
+            if (weightObj instanceof Integer) {
+                data.append("WEIGHT: ").append(weightObj).append("\n");
+            }
+
+            // 5. Special Attack & Spellbook
+            int specAmt = getVarbitValue(client, 300);
+            if (specAmt >= 0) data.append("SPECIAL_ATTACK: ").append(specAmt / 10).append("\n");
+
+            int specActive = getVarbitValue(client, 301);
+            if (specActive >= 0) data.append("SPECIAL_ATTACK_ACTIVE: ").append(specActive == 1 ? "True" : "False").append("\n");
+
+            int spellbook = getVarbitValue(client, 4070);
+            String sbName = "Standard";
+            if (spellbook == 1) sbName = "Ancient";
+            else if (spellbook == 2) sbName = "Lunar";
+            else if (spellbook == 3) sbName = "Arceuus";
+            data.append("MAGIC_SPELLBOOK: ").append(sbName).append("\n");
+
+            int autocast = getVarbitValue(client, 276);
+            if (autocast > 0) data.append("AUTOCAST_SPELL: ").append(autocast).append("\n");
+
+            String activeTab = extractActiveTab(client);
+            data.append("ACTIVE_TAB: ").append(activeTab).append("\n");
+
+            // Movement & Idle state
+            int pAnim = -1, pPoseAnim = -1, pIdlePose = -1;
+            Object animObj = invokeMethodQuietly(player, "getAnimation");
+            if (animObj instanceof Integer) pAnim = (Integer) animObj;
+            Object poseAnimObj = invokeMethodQuietly(player, "getPoseAnimation");
+            if (poseAnimObj instanceof Integer) pPoseAnim = (Integer) poseAnimObj;
+            Object idlePoseObj = invokeMethodQuietly(player, "getIdlePoseAnimation");
+            if (idlePoseObj instanceof Integer) pIdlePose = (Integer) idlePoseObj;
+
+            boolean isMoving = (pPoseAnim != -1 && pIdlePose != -1 && pPoseAnim != pIdlePose);
+            boolean isIdle = (pAnim == -1 && !isMoving);
+            data.append("IS_MOVING: ").append(isMoving ? "True" : "False").append("\n");
+            data.append("IS_IDLE: ").append(isIdle ? "True" : "False").append("\n");
+
+            // Vengeance
+            int vengActive = getVarbitValue(client, 2451);
+            data.append("VENGEANCE_ACTIVE: ").append(vengActive == 1 ? "True" : "False").append("\n");
+
+            // Wilderness
+            if (playerY >= 3520 && playerY <= 4000 && playerX >= 2940 && playerX <= 3400) {
+                int wildyLvl = (playerY - 3520) / 8 + 1;
+                data.append("WILDERNESS_LEVEL: ").append(wildyLvl).append("\n");
+                data.append("IN_WILDERNESS: True\n");
             } else {
-                try {
-                    Class<?> skillEnumClass = null;
-                    try {
-                        skillEnumClass = Class.forName("net.runelite.api.Skill", false, client.getClass().getClassLoader());
-                    } catch (Throwable ignored) {}
-                    if (skillEnumClass != null && skillEnumClass.isEnum()) {
-                        Object[] skillConstants = skillEnumClass.getEnumConstants();
-                        Method getRealSkill = null;
-                        Method getBoostedSkill = null;
-                        try { getRealSkill = client.getClass().getMethod("getRealSkillLevel", skillEnumClass); } catch (Throwable ignored) {}
-                        try { getBoostedSkill = client.getClass().getMethod("getBoostedSkillLevel", skillEnumClass); } catch (Throwable ignored) {}
-
-                        if (getRealSkill != null) {
-                            for (Object sc : skillConstants) {
-                                try {
-                                    String sName = ((Enum<?>) sc).name();
-                                    int real = (Integer) getRealSkill.invoke(client, sc);
-                                    int boosted = getBoostedSkill != null ? (Integer) getBoostedSkill.invoke(client, sc) : real;
-                                    data.append("SKILL[").append(sName).append("]: ").append(boosted).append("/").append(real).append("\n");
-                                } catch (Throwable ignored) {}
-                            }
-                        }
-                    }
-                } catch (Throwable ignored) {}
+                data.append("WILDERNESS_LEVEL: 0\n");
+                data.append("IN_WILDERNESS: False\n");
             }
 
-            // Current Tab
-            try {
-                int tab = -1;
-                try {
-                    Method getVarc = client.getClass().getMethod("getVarcIntValue", int.class);
-                    getVarc.setAccessible(true);
-                    tab = (Integer) getVarc.invoke(client, 171);
-                } catch (Throwable t1) {
-                    try {
-                        Method getVarc = client.getClass().getMethod("getVarcInt", int.class);
-                        getVarc.setAccessible(true);
-                        tab = (Integer) getVarc.invoke(client, 171);
-                    } catch (Throwable t2) {
-                        try {
-                            Method getVar = client.getClass().getMethod("getVar", int.class);
-                            getVar.setAccessible(true);
-                            tab = (Integer) getVar.invoke(client, 171);
-                        } catch (Throwable t3) {
-                            for (Method m : client.getClass().getMethods()) {
-                                if ((m.getName().equals("getVar") || m.getName().equals("getVarcIntValue")) && m.getParameterCount() == 1) {
-                                    Class<?> pType = m.getParameterTypes()[0];
-                                    if (pType.isEnum()) {
-                                        for (Object ec : pType.getEnumConstants()) {
-                                            if (ec.toString().contains("INVENTORY_TAB") || ec.toString().contains("TAB")) {
-                                                try {
-                                                    m.setAccessible(true);
-                                                    tab = (Integer) m.invoke(client, ec);
-                                                    if (tab >= 0 && tab <= 14) break;
-                                                } catch (Throwable ignored) {}
-                                            }
-                                        }
-                                    }
-                                }
-                                if (tab >= 0 && tab <= 14) break;
-                            }
-                        }
-                    }
-                }
-                if (tab >= 0 && tab <= 14) {
-                    data.append("CURRENT_TAB: ").append(tab).append("\n");
-                }
-            } catch (Throwable ignored) {}
+            // 6. Inventory & Equipment
+            readItemContainer(client, 93, "INV", 28, data);
+            readItemContainer(client, 94, "EQUIP", 14, data);
 
-            // Energy & Weight
-            try {
-                Method getEnergy = client.getClass().getMethod("getEnergy");
-                getEnergy.setAccessible(true);
-                int energy = (Integer) getEnergy.invoke(client);
-                data.append("RUN_ENERGY: ").append(energy / 100).append("%\n");
-            } catch (Throwable ignored) {}
+            // 7. Bank & Shop Containers
+            processBankAndShop(client, data);
 
-            try {
-                Method getWeight = client.getClass().getMethod("getWeight");
-                getWeight.setAccessible(true);
-                int weight = (Integer) getWeight.invoke(client);
-                data.append("WEIGHT: ").append(weight).append(" kg\n");
-            } catch (Throwable ignored) {}
+            // 7.5 Grand Exchange & Storage Containers
+            processGrandExchange(client, data);
+            processStorageContainers(client, data);
 
-            // Inventory & Equipment via ItemContainer
-            try { readRuneLiteItemContainer(client, 93, "INV", 28, data); } catch (Throwable ignored) {}
-            try { readRuneLiteItemContainer(client, 94, "EQUIP", 14, data); } catch (Throwable ignored) {}
+            // 8. Scene Objects & Ground Items
+            processSceneObjectsAndGroundItems(client, playerX, playerY, plane, data);
 
-            // Magic & Prayers
-            try { processRuneLiteMagic(client, data); } catch (Throwable ignored) {}
-            try { processRuneLitePrayers(client, data); } catch (Throwable ignored) {}
+            // 9. Surrounding NPCs, Players & Unified PK Combat State
+            processCombatAndEntities(client, player, localPlayerName, playerX, playerY, plane, data);
 
-            // NPCs
-            try {
-                Object npcsObj = null;
-                // Check modern RuneLite WorldView first
-                try {
-                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
-                    getTopView.setAccessible(true);
-                    Object topView = getTopView.invoke(client);
-                    if (topView != null) {
-                        for (String mName : new String[]{"npcs", "getNpcs", "getNPCs"}) {
-                            try {
-                                Method m = topView.getClass().getMethod(mName);
-                                m.setAccessible(true);
-                                npcsObj = m.invoke(topView);
-                                if (npcsObj != null) break;
-                            } catch (Throwable ignored) {}
-                        }
-                    }
-                } catch (Throwable ignored) {}
+            // 10. Dialogue
+            processDialogue(client, data);
 
-                // Fallback to direct client call
-                if (npcsObj == null) {
-                    for (String mName : new String[]{"getNpcs", "npcs", "getNPCs"}) {
-                        try {
-                            Method m = client.getClass().getMethod(mName);
-                            m.setAccessible(true);
-                            npcsObj = m.invoke(client);
-                            if (npcsObj != null) break;
-                        } catch (Throwable ignored) {}
-                    }
-                }
+            // 11. Active Prayers
+            processPrayers(client, data);
 
-                if (npcsObj != null) {
-                    int count = 0;
-                    int fishCount = 0;
-                    try {
-                        if (npcsObj instanceof Iterable) {
-                            for (Object npc : (Iterable<?>) npcsObj) {
-                                if (npc != null) {
-                                    if (count < 25) {
-                                        appendRuneLiteNpc(client, npc, count, playerX, playerY, data);
-                                        count++;
-                                    }
-                                    if (isFishingSpotNpc(client, npc) && fishCount < 20) {
-                                        appendRuneLiteFishingSpot(client, npc, fishCount, playerX, playerY, data);
-                                        fishCount++;
-                                    }
-                                }
-                            }
-                        } else if (npcsObj instanceof Object[]) {
-                            Object[] npcArr = (Object[]) npcsObj;
-                            for (Object npc : npcArr) {
-                                if (npc != null) {
-                                    if (count < 25) {
-                                        appendRuneLiteNpc(client, npc, count, playerX, playerY, data);
-                                        count++;
-                                    }
-                                    if (isFishingSpotNpc(client, npc) && fishCount < 20) {
-                                        appendRuneLiteFishingSpot(client, npc, fishCount, playerX, playerY, data);
-                                        fishCount++;
-                                    }
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-                    data.append("TOTAL_NPCS: ").append(count).append("\n");
-                    data.append("TOTAL_FISHING_SPOTS: ").append(fishCount).append("\n");
-                }
-            } catch (Throwable ignored) {}
+            // 12. Buffs, Potion Timers & Poison/Venom Status
+            processBuffsAndStatusTimers(client, data);
 
-            // Players
-            try {
-                Object playersObj = null;
-                // Check modern RuneLite WorldView first
-                try {
-                    Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
-                    getTopView.setAccessible(true);
-                    Object topView = getTopView.invoke(client);
-                    if (topView != null) {
-                        for (String mName : new String[]{"players", "getPlayers"}) {
-                            try {
-                                Method m = topView.getClass().getMethod(mName);
-                                m.setAccessible(true);
-                                playersObj = m.invoke(topView);
-                                if (playersObj != null) break;
-                            } catch (Throwable ignored) {}
-                        }
-                    }
-                } catch (Throwable ignored) {}
-
-                // Fallback to direct client call
-                if (playersObj == null) {
-                    for (String mName : new String[]{"getPlayers", "players"}) {
-                        try {
-                            Method m = client.getClass().getMethod(mName);
-                            m.setAccessible(true);
-                            playersObj = m.invoke(client);
-                            if (playersObj != null) break;
-                        } catch (Throwable ignored) {}
-                    }
-                }
-
-                if (playersObj != null) {
-                    int count = 0;
-                    try {
-                        if (playersObj instanceof Iterable) {
-                            for (Object p : (Iterable<?>) playersObj) {
-                                if (p != null && count < 25) {
-                                    appendRuneLitePlayer(client, p, count, playerX, playerY, player, data);
-                                    count++;
-                                }
-                            }
-                        } else if (playersObj instanceof Object[]) {
-                            Object[] pArr = (Object[]) playersObj;
-                            for (Object p : pArr) {
-                                if (p != null && count < 25) {
-                                    appendRuneLitePlayer(client, p, count, playerX, playerY, player, data);
-                                    count++;
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-                    data.append("TOTAL_PLAYERS: ").append(count).append("\n");
-                }
-            } catch (Throwable ignored) {}
-
-            // Plane & Camera & FPS
-            try {
-                Method getPlane = client.getClass().getMethod("getPlane");
-                getPlane.setAccessible(true);
-                plane = (Integer) getPlane.invoke(client);
-                data.append("PLANE: ").append(plane).append("\n");
-            } catch (Throwable ignored) {}
-
-            try {
-                Method getFPS = client.getClass().getMethod("getFPS");
-                getFPS.setAccessible(true);
-                data.append("FPS: ").append(getFPS.invoke(client)).append("\n");
-            } catch (Throwable ignored) {}
-
-            // Special Attack
-            try { processRuneLiteSpecialAttack(client, data); } catch (Throwable ignored) {}
-
-            // Slayer
-            try { processRuneLiteSlayer(client, data); } catch (Throwable ignored) {}
-
-            // Dialog
-            try { processRuneLiteDialog(client, data); } catch (Throwable ignored) {}
-
-            // Bank and Shop
-            try { processRuneLiteBankAndShop(client, data); } catch (Throwable ignored) {}
-
-            // Scene Objects (Trees, Banks, Shops, Altars, Rocks, Shortcuts, Agility Obstacles) & Ground Items
-            try { processRuneLiteSceneObjects(client, playerX, playerY, plane, data); } catch (Throwable ignored) {}
-
-            // Minigames (Pest Control, Wintertodt, Tempoross, GotR, BA, Castle Wars, etc.)
-            try { processRuneLiteMinigames(client, playerX, playerY, data); } catch (Throwable ignored) {}
-
-            return true;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private static final String[] STANDARD_PRAYER_NAMES = {
-        "Thick Skin", "Burst of Strength", "Clarity of Thought", "Sharp Eye", "Mystic Will",
-        "Rock Skin", "Superhuman Strength", "Improved Reflexes", "Rapid Restore", "Rapid Heal",
-        "Protect Item", "Hawk Eye", "Mystic Lore", "Steel Skin", "Ultimate Strength",
-        "Incredible Reflexes", "Protect from Magic", "Protect from Missiles", "Protect from Melee",
-        "Eagle Eye", "Mystic Might", "Retribution", "Redemption", "Smite",
-        "Preserve", "Chivalry", "Piety", "Rigour", "Augury"
-    };
-
-    private static int getVarbitValue(Object client, int varbitId) {
-        if (client == null || varbitId < 0) return -1;
-        // 1. Direct 1-arg getVarbitValue/getVarbit
-        for (String mName : new String[]{"getVarbitValue", "getVarbit", "getVar"}) {
-            try {
-                Method m = client.getClass().getMethod(mName, int.class);
-                m.setAccessible(true);
-                Object res = m.invoke(client, varbitId);
-                if (res instanceof Number) {
-                    return ((Number) res).intValue();
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // 2. 2-arg getVarbitValue(int[] varps, int varbitId)
-        try {
-            int[] varps = null;
-            for (String vName : new String[]{"getVarps", "getServerVarps"}) {
-                try {
-                    Method vm = client.getClass().getMethod(vName);
-                    vm.setAccessible(true);
-                    Object r = vm.invoke(client);
-                    if (r instanceof int[]) {
-                        varps = (int[]) r;
-                        break;
-                    }
-                } catch (Throwable ignored) {}
-            }
-            if (varps != null) {
-                for (String mName : new String[]{"getVarbitValue", "getVarbit"}) {
-                    try {
-                        Method m = client.getClass().getMethod(mName, int[].class, int.class);
-                        m.setAccessible(true);
-                        Object res = m.invoke(client, varps, varbitId);
-                        if (res instanceof Number) {
-                            return ((Number) res).intValue();
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        // 3. Scan all methods matching varbit signature
-        for (Method m : client.getClass().getMethods()) {
-            if (m.getName().toLowerCase().contains("varbit") && m.getParameterCount() == 1 && m.getParameterTypes()[0] == int.class) {
-                try {
-                    m.setAccessible(true);
-                    Object res = m.invoke(client, varbitId);
-                    if (res instanceof Number) {
-                        return ((Number) res).intValue();
-                    }
-                } catch (Throwable ignored) {}
-            }
-        }
-        return -1;
-    }
-
-    private static int getVarpValue(Object client, int varpId) {
-        if (client == null || varpId < 0) return -1;
-        for (String mName : new String[]{"getVarpValue", "getVarp", "getVarpValueInt", "getVar"}) {
-            try {
-                Method m = client.getClass().getMethod(mName, int.class);
-                m.setAccessible(true);
-                Object res = m.invoke(client, varpId);
-                if (res instanceof Number) {
-                    return ((Number) res).intValue();
-                }
-            } catch (Throwable ignored) {}
-        }
-        // Direct varps array lookup fallback
-        try {
-            for (String vName : new String[]{"getVarps", "getServerVarps"}) {
-                try {
-                    Method vm = client.getClass().getMethod(vName);
-                    vm.setAccessible(true);
-                    Object r = vm.invoke(client);
-                    if (r instanceof int[]) {
-                        int[] arr = (int[]) r;
-                        if (varpId >= 0 && varpId < arr.length) {
-                            return arr[varpId];
-                        }
-                    }
-                } catch (Throwable ignored) {}
-            }
-        } catch (Throwable ignored) {}
-        return -1;
-    }
-
-    private static String getAutocastSpellName(int id) {
-        switch (id) {
-            case 1: return "Wind Strike";
-            case 2: return "Water Strike";
-            case 3: return "Earth Strike";
-            case 4: return "Fire Strike";
-            case 5: return "Wind Bolt";
-            case 6: return "Water Bolt";
-            case 7: return "Earth Bolt";
-            case 8: return "Fire Bolt";
-            case 9: return "Wind Blast";
-            case 10: return "Water Blast";
-            case 11: return "Earth Blast";
-            case 12: return "Fire Blast";
-            case 13: return "Wind Wave";
-            case 14: return "Water Wave";
-            case 15: return "Earth Wave";
-            case 16: return "Fire Wave";
-            case 17: return "Crumble Undead";
-            case 18: return "Iban Blast";
-            case 19: return "Magic Dart";
-            case 20: return "Saradomin Strike";
-            case 21: return "Claws of Guthix";
-            case 22: return "Flames of Zamorak";
-            case 23: return "Slayer Dart";
-            case 31: return "Smoke Rush";
-            case 32: return "Shadow Rush";
-            case 33: return "Blood Rush";
-            case 34: return "Ice Rush";
-            case 35: return "Smoke Burst";
-            case 36: return "Shadow Burst";
-            case 37: return "Blood Burst";
-            case 38: return "Ice Burst";
-            case 39: return "Smoke Blitz";
-            case 40: return "Shadow Blitz";
-            case 41: return "Blood Blitz";
-            case 42: return "Ice Blitz";
-            case 43: return "Smoke Barrage";
-            case 44: return "Shadow Barrage";
-            case 45: return "Blood Barrage";
-            case 46: return "Ice Barrage";
-            case 48: return "Wind Surge";
-            case 49: return "Water Surge";
-            case 50: return "Earth Surge";
-            case 51: return "Fire Surge";
-            case 52: return "Infernal Teleport";
-            case 53: return "Ghostly Grasp";
-            case 54: return "Skeletal Grasp";
-            case 55: return "Undead Grasp";
-            case 56: return "Infernal Grasp";
-            case 57: return "Lesser Demonbane";
-            case 58: return "Superior Demonbane";
-            case 59: return "Dark Demonbane";
-            case 60: return "Lesser Corruption";
-            case 61: return "Greater Corruption";
-            case 62: return "Shadow Veil";
-            case 63: return "Ward of Arceuus";
-            default: return id > 0 ? ("Spell #" + id) : "None";
-        }
-    }
-
-    private static String formatEnumPrayerName(String enumName) {
-        if (enumName == null) return "";
-        String[] parts = enumName.toLowerCase().split("_");
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < parts.length; i++) {
-            String p = parts[i];
-            if (p.isEmpty()) continue;
-            if (i > 0) {
-                sb.append(" ");
-                if (p.equals("from") || p.equals("of")) {
-                    sb.append(p);
-                    continue;
-                }
-            }
-            sb.append(Character.toUpperCase(p.charAt(0))).append(p.substring(1));
-        }
-        return sb.toString();
-    }
-
-    private static void processRuneLiteMagic(Object client, StringBuilder data) {
-        if (client == null) return;
-        try {
-            // 1. Spellbook (Varbit 4070 / SPELLBOOK_VARBIT)
-            int spellbookId = getVarbitValue(client, 4070);
-            if (spellbookId < 0) {
-                // Fallback to Varp 1224 (bits 0-2)
-                int varp1224 = getVarpValue(client, 1224);
-                if (varp1224 >= 0) {
-                    spellbookId = (varp1224 & 0x7);
-                }
+            // 13. Camera & Canvas
+            Object camX = invokeMethodQuietly(client, "getCameraX");
+            Object camY = invokeMethodQuietly(client, "getCameraY");
+            Object camZ = invokeMethodQuietly(client, "getCameraZ");
+            Object pitch = invokeMethodQuietly(client, "getCameraPitch");
+            Object yaw = invokeMethodQuietly(client, "getCameraYaw");
+            if (camX instanceof Integer && camY instanceof Integer && camZ instanceof Integer) {
+                data.append("CAMERA: ").append(camX).append(",").append(camY).append(",").append(camZ)
+                    .append(",").append(pitch != null ? pitch : 0)
+                    .append(",").append(yaw != null ? yaw : 0).append("\n");
             }
 
-            String spellbookName;
-            switch (spellbookId) {
-                case 0: spellbookName = "Standard"; break;
-                case 1: spellbookName = "Ancient Magicks"; break;
-                case 2: spellbookName = "Lunar"; break;
-                case 3: spellbookName = "Arceuus"; break;
-                case 4: spellbookName = "Ancient (Swap)"; break;
-                case 5: spellbookName = "Lunar (Swap)"; break;
-                case 6: spellbookName = "Arceuus (Swap)"; break;
-                default: spellbookName = spellbookId >= 0 ? ("Spellbook " + spellbookId) : "Standard"; break;
-            }
-            data.append("SPELLBOOK: ").append(spellbookName).append("\n");
-            if (spellbookId >= 0) {
-                data.append("SPELLBOOK_ID: ").append(spellbookId).append("\n");
+            Object cw = invokeMethodQuietly(client, "getCanvasWidth");
+            Object ch = invokeMethodQuietly(client, "getCanvasHeight");
+            if (cw instanceof Integer && ch instanceof Integer) {
+                data.append("CANVAS: ").append(cw).append(",").append(ch).append("\n");
             }
 
-            // 2. Autocast Spell (VarPlayer 276)
-            int autocastId = getVarpValue(client, 276);
-            String autocastName = getAutocastSpellName(autocastId);
-            data.append("AUTOCAST_SPELL: ").append(autocastName).append("\n");
-            if (autocastId >= 0) {
-                data.append("AUTOCAST_ID: ").append(autocastId).append("\n");
-            }
-
-            // 3. Selected / Targeting Spell (e.g. client.getSelectedSpellName())
-            String selectedSpell = null;
-            try {
-                Method getSel = client.getClass().getMethod("getSelectedSpellName");
-                getSel.setAccessible(true);
-                Object res = getSel.invoke(client);
-                if (res instanceof String) {
-                    String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                    if (!s.isEmpty()) {
-                        selectedSpell = s;
-                    }
-                }
-            } catch (Throwable ignored) {}
-            if (selectedSpell != null) {
-                data.append("SELECTED_SPELL: ").append(selectedSpell).append("\n");
-            } else {
-                data.append("SELECTED_SPELL: None\n");
-            }
-
-            // 4. Spell Selected boolean
-            boolean isSpellSelected = false;
-            try {
-                Method getSpellSel = client.getClass().getMethod("getSpellSelected");
-                getSpellSel.setAccessible(true);
-                Object res = getSpellSel.invoke(client);
-                if (res instanceof Boolean) {
-                    isSpellSelected = (Boolean) res;
-                }
-            } catch (Throwable ignored) {}
-            data.append("SPELL_SELECTED: ").append(isSpellSelected ? "1" : "0").append("\n");
         } catch (Throwable ignored) {}
     }
 
-    private static void processRuneLitePrayers(Object client, StringBuilder data) {
-        if (client == null) return;
-        try {
-            // 1. Quick Prayer (Varbit 4103)
-            int quickPrayer = getVarbitValue(client, 4103);
-            data.append("QUICK_PRAYER: ").append(quickPrayer == 1 ? "Active" : "Inactive").append("\n");
-            data.append("QUICK_PRAYER_VALUE: ").append(quickPrayer).append("\n");
-
-            // 2. Active Prayers Detection
-            List<String> activePrayers = new ArrayList<>();
-            Map<String, Boolean> prayerStatus = new LinkedHashMap<>();
-
-            // Initialize all with false
-            for (String pName : STANDARD_PRAYER_NAMES) {
-                prayerStatus.put(pName, false);
-            }
-
-            // Try RuneLite client.isPrayerActive(Prayer) method
-            boolean usedRuneLiteEnum = false;
-            try {
-                ClassLoader cl = client.getClass().getClassLoader();
-                Class<?> prayerClass = null;
-                try {
-                    prayerClass = Class.forName("net.runelite.api.Prayer", true, cl);
-                } catch (Throwable t) {
-                    for (Method m : client.getClass().getMethods()) {
-                        if (m.getName().equals("isPrayerActive") && m.getParameterCount() == 1) {
-                            prayerClass = m.getParameterTypes()[0];
-                            break;
-                        }
-                    }
-                }
-
-                if (prayerClass != null && prayerClass.isEnum()) {
-                    Method isPrayerActive = client.getClass().getMethod("isPrayerActive", prayerClass);
-                    isPrayerActive.setAccessible(true);
-                    for (Object pConst : prayerClass.getEnumConstants()) {
-                        String enumName = pConst.toString();
-                        String formattedName = formatEnumPrayerName(enumName);
-                        boolean isActive = (Boolean) isPrayerActive.invoke(client, pConst);
-                        prayerStatus.put(formattedName, isActive);
-                        if (isActive) {
-                            activePrayers.add(formattedName);
-                        }
-                    }
-                    usedRuneLiteEnum = true;
-                }
-            } catch (Throwable ignored) {}
-
-            // Fallback / complement with VarPlayer 83 bitmask
-            if (!usedRuneLiteEnum) {
-                int prayerMask = getVarpValue(client, 83); // VarPlayer.PRAYER_ACTIVE = 83
-                if (prayerMask >= 0) {
-                    for (int i = 0; i < STANDARD_PRAYER_NAMES.length; i++) {
-                        String pName = STANDARD_PRAYER_NAMES[i];
-                        boolean isActive = (prayerMask & (1 << i)) != 0;
-                        prayerStatus.put(pName, isActive);
-                        if (isActive) {
-                            activePrayers.add(pName);
-                        }
-                    }
-                }
-            }
-
-            // Telemetry: Active Prayers Summary
-            if (activePrayers.isEmpty()) {
-                data.append("ACTIVE_PRAYERS: None\n");
-            } else {
-                StringBuilder activeSb = new StringBuilder();
-                for (int i = 0; i < activePrayers.size(); i++) {
-                    if (i > 0) activeSb.append(", ");
-                    activeSb.append(activePrayers.get(i));
-                }
-                data.append("ACTIVE_PRAYERS: ").append(activeSb.toString()).append("\n");
-            }
-            data.append("ACTIVE_PRAYER_COUNT: ").append(activePrayers.size()).append("\n");
-
-            // Telemetry: Individual prayer statuses
-            for (Map.Entry<String, Boolean> entry : prayerStatus.entrySet()) {
-                data.append("PRAYER[").append(entry.getKey()).append("]: ")
-                    .append(entry.getValue() ? "1" : "0").append("\n");
-            }
-        } catch (Throwable ignored) {}
-    }
-
-    private static void readRuneLiteItemContainer(Object client, int containerId, String prefix, int maxItems, StringBuilder data) {
-        int[] itemIds = new int[maxItems];
-        int[] itemQtys = new int[maxItems];
-        String[] itemNames = new String[maxItems];
-        for (int i = 0; i < maxItems; i++) {
-            itemIds[i] = -1;
-            itemQtys[i] = 0;
-        }
-
-        boolean found = false;
-
-        // Strategy 1: Direct client.getItemContainer(int) or client.getItemContainer(InventoryID)
-        try {
-            Object container = null;
-            for (Method m : client.getClass().getMethods()) {
-                if (m.getName().equals("getItemContainer") && m.getParameterCount() == 1) {
-                    Class<?> pType = m.getParameterTypes()[0];
-                    if (pType == int.class || pType == Integer.class) {
-                        try {
-                            m.setAccessible(true);
-                            container = m.invoke(client, containerId);
-                            if (container != null) break;
-                        } catch (Throwable ignored) {}
-                    } else if (pType.isEnum()) {
-                        for (Object enumConst : pType.getEnumConstants()) {
-                            try {
-                                String eName = ((Enum<?>) enumConst).name();
-                                boolean match = false;
-                                if (containerId == 93 && (eName.equalsIgnoreCase("INVENTORY") || eName.contains("INV"))) match = true;
-                                if (containerId == 94 && (eName.equalsIgnoreCase("EQUIPMENT") || eName.contains("EQUIP"))) match = true;
-                                if (containerId == 95 && (eName.equalsIgnoreCase("BANK") || eName.contains("BANK"))) match = true;
-                                if (!match) {
-                                    try {
-                                        Method getId = pType.getMethod("getId");
-                                        getId.setAccessible(true);
-                                        int id = (Integer) getId.invoke(enumConst);
-                                        if (id == containerId) match = true;
-                                    } catch (Throwable ignored) {}
-                                }
-                                if (match) {
-                                    m.setAccessible(true);
-                                    container = m.invoke(client, enumConst);
-                                    if (container != null) break;
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                        if (container != null) break;
-                    }
-                }
-            }
-
-            // Strategy 2: client.getItemContainers() HashTable / Map / Collection
-            if (container == null) {
-                for (Method m : client.getClass().getMethods()) {
-                    if (m.getName().startsWith("getItemContainer") && m.getParameterCount() == 0) {
-                        try {
-                            m.setAccessible(true);
-                            Object res = m.invoke(client);
-                            if (res != null) {
-                                if (res instanceof Map) {
-                                    container = ((Map<?, ?>) res).get(containerId);
-                                }
-                                if (container == null) {
-                                    try {
-                                        Method getMethod = res.getClass().getMethod("get", long.class);
-                                        getMethod.setAccessible(true);
-                                        container = getMethod.invoke(res, (long) containerId);
-                                    } catch (Throwable ignored) {}
-                                }
-                                if (container == null) {
-                                    try {
-                                        Method getMethod = res.getClass().getMethod("get", int.class);
-                                        getMethod.setAccessible(true);
-                                        container = getMethod.invoke(res, containerId);
-                                    } catch (Throwable ignored) {}
-                                }
-                                if (container == null && res instanceof Iterable) {
-                                    for (Object node : (Iterable<?>) res) {
-                                        if (node != null) {
-                                            try {
-                                                Method getId = node.getClass().getMethod("getId");
-                                                getId.setAccessible(true);
-                                                int nid = (Integer) getId.invoke(node);
-                                                if (nid == containerId) {
-                                                    container = node;
-                                                    break;
-                                                }
-                                            } catch (Throwable ignored) {}
-                                        }
-                                    }
-                                }
-                            }
-                            if (container != null) break;
-                        } catch (Throwable ignored) {}
-                    }
-                }
-            }
-
-            if (container != null) {
-                Object itemsObj = null;
-                try {
-                    Method getItems = container.getClass().getMethod("getItems");
-                    getItems.setAccessible(true);
-                    itemsObj = getItems.invoke(container);
-                } catch (Throwable ignored) {}
-
-                if (itemsObj instanceof Object[]) {
-                    Object[] items = (Object[]) itemsObj;
-                    for (int i = 0; i < maxItems && i < items.length; i++) {
-                        if (items[i] != null) {
-                            Object itm = items[i];
-                            int id = -1;
-                            int qty = 0;
-                            try {
-                                Method getId = itm.getClass().getMethod("getId");
-                                getId.setAccessible(true);
-                                id = (Integer) getId.invoke(itm);
-                            } catch (Throwable ignored) {}
-                            try {
-                                Method getQty = itm.getClass().getMethod("getQuantity");
-                                getQty.setAccessible(true);
-                                qty = (Integer) getQty.invoke(itm);
-                            } catch (Throwable ignored) {}
-
-                            if (id > 0 && id != 65535) {
-                                itemIds[i] = id;
-                                itemQtys[i] = Math.max(1, qty);
-                                found = true;
-                            }
-                        }
-                    }
-                } else if (itemsObj instanceof Collection) {
-                    int i = 0;
-                    for (Object itm : (Collection<?>) itemsObj) {
-                        if (i >= maxItems) break;
-                        if (itm != null) {
-                            int id = -1;
-                            int qty = 0;
-                            try {
-                                Method getId = itm.getClass().getMethod("getId");
-                                getId.setAccessible(true);
-                                id = (Integer) getId.invoke(itm);
-                            } catch (Throwable ignored) {}
-                            try {
-                                Method getQty = itm.getClass().getMethod("getQuantity");
-                                getQty.setAccessible(true);
-                                qty = (Integer) getQty.invoke(itm);
-                            } catch (Throwable ignored) {}
-
-                            if (id > 0 && id != 65535) {
-                                itemIds[i] = id;
-                                itemQtys[i] = Math.max(1, qty);
-                                found = true;
-                            }
-                        }
-                        i++;
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        // Strategy 3: RuneLite Widget fallback
-        if (!found) {
-            try {
-                int[][] targetWidgets = containerId == 93
-                        ? new int[][]{{149, 0}, {9764864, -1}, {15, 3}, {548, 58}, {161, 58}, {164, 58}}
-                        : new int[][]{{387, 0}, {25362432, -1}, {84, 0}, {5505024, -1}};
-
-                for (int[] wSpec : targetWidgets) {
-                    Object widget = null;
-                    if (wSpec[1] >= 0) {
-                        try {
-                            Method getWidget = client.getClass().getMethod("getWidget", int.class, int.class);
-                            getWidget.setAccessible(true);
-                            widget = getWidget.invoke(client, wSpec[0], wSpec[1]);
-                        } catch (Throwable ignored) {}
-                    } else {
-                        try {
-                            Method getWidget = client.getClass().getMethod("getWidget", int.class);
-                            getWidget.setAccessible(true);
-                            widget = getWidget.invoke(client, wSpec[0]);
-                        } catch (Throwable ignored) {}
-                    }
-
-                    if (widget != null) {
-                        // Check dynamic children
-                        Object childrenObj = null;
-                        for (String mName : new String[]{"getChildren", "getDynamicChildren", "getNestedChildren"}) {
-                            try {
-                                Method m = widget.getClass().getMethod(mName);
-                                m.setAccessible(true);
-                                childrenObj = m.invoke(widget);
-                                if (childrenObj != null) break;
-                            } catch (Throwable ignored) {}
-                        }
-
-                        if (childrenObj instanceof Object[]) {
-                            Object[] children = (Object[]) childrenObj;
-                            if (children.length >= maxItems) {
-                                for (int i = 0; i < maxItems && i < children.length; i++) {
-                                    if (children[i] != null) {
-                                        Object ch = children[i];
-                                        int id = -1;
-                                        int qty = 0;
-                                        String name = null;
-                                        try {
-                                            Method getId = ch.getClass().getMethod("getItemId");
-                                            getId.setAccessible(true);
-                                            id = (Integer) getId.invoke(ch);
-                                        } catch (Throwable ignored) {}
-                                        try {
-                                            Method getQty = ch.getClass().getMethod("getItemQuantity");
-                                            getQty.setAccessible(true);
-                                            qty = (Integer) getQty.invoke(ch);
-                                        } catch (Throwable ignored) {}
-                                        try {
-                                            Method getName = ch.getClass().getMethod("getName");
-                                            getName.setAccessible(true);
-                                            Object n = getName.invoke(ch);
-                                            if (n instanceof String) {
-                                                String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                                                if (!s.isEmpty() && !s.equalsIgnoreCase("null")) name = s;
-                                            }
-                                        } catch (Throwable ignored) {}
-
-                                        if (id > 0 && id != 65535) {
-                                            itemIds[i] = id;
-                                            itemQtys[i] = Math.max(1, qty);
-                                            itemNames[i] = name;
-                                            found = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check widget.getItems() & widget.getItemQuantities()
-                        if (!found) {
-                            try {
-                                Method getItems = widget.getClass().getMethod("getItems");
-                                getItems.setAccessible(true);
-                                int[] wItems = (int[]) getItems.invoke(widget);
-                                int[] wQtys = null;
-                                try {
-                                    Method getQtys = widget.getClass().getMethod("getItemQuantities");
-                                    getQtys.setAccessible(true);
-                                    wQtys = (int[]) getQtys.invoke(widget);
-                                } catch (Throwable ignored) {}
-
-                                if (wItems != null && wItems.length >= maxItems) {
-                                    for (int i = 0; i < maxItems && i < wItems.length; i++) {
-                                        int id = wItems[i];
-                                        int qty = (wQtys != null && i < wQtys.length) ? wQtys[i] : 1;
-                                        if (id > 0 && id != 65535) {
-                                            itemIds[i] = id;
-                                            itemQtys[i] = Math.max(1, qty);
-                                            found = true;
-                                        }
-                                    }
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                    }
-                    if (found) break;
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // Format and append output
-        for (int i = 0; i < maxItems; i++) {
-            int id = itemIds[i];
-            int qty = itemQtys[i];
-            if (id > 0 && id != 65535) {
-                String name = itemNames[i];
-                if (name == null) {
-                    name = resolveItemName(client, id);
-                }
-                if (name != null && !name.isEmpty() && !name.equalsIgnoreCase("null")) {
-                    data.append(prefix).append("[").append(i).append("]: ").append(name).append(",").append(qty).append("\n");
-                } else {
-                    data.append(prefix).append("[").append(i).append("]: ").append(id).append(",").append(qty).append("\n");
-                }
-            } else {
-                data.append(prefix).append("[").append(i).append("]: 0,0\n");
-            }
-        }
-    }
-
-    private static String resolveItemName(Object client, int id) {
-        if (id <= 0) return null;
-        String cached = ITEM_NAME_CACHE.get(id);
-        if (cached != null) return cached;
-
-        // 1. Try RuneLite ItemManager
-        if (runeLiteItemManager != null) {
-            for (String mName : new String[]{"getItemComposition", "getItemDefinition"}) {
-                try {
-                    Method m = runeLiteItemManager.getClass().getMethod(mName, int.class);
-                    m.setAccessible(true);
-                    Object comp = m.invoke(runeLiteItemManager, id);
-                    if (comp != null) {
-                        String name = extractNameFromItemComposition(client, comp, id);
-                        if (name != null) {
-                            ITEM_NAME_CACHE.put(id, name);
-                            return name;
-                        }
-                    }
-                } catch (Throwable ignored) {}
-            }
-        }
-
-        // 2. Try RuneLite Client / RSClient instance
-        Object targetClient = client != null ? client : runeLiteClient;
-        if (targetClient != null) {
-            for (String mName : new String[]{"getItemComposition", "getItemDefinition", "getRSItemDefinition", "createItemComposition"}) {
-                try {
-                    for (Method m : targetClient.getClass().getMethods()) {
-                        if (m.getName().equalsIgnoreCase(mName) && m.getParameterCount() == 1
-                                && (m.getParameterTypes()[0] == int.class || m.getParameterTypes()[0] == Integer.class)) {
-                            m.setAccessible(true);
-                            Object comp = m.invoke(targetClient, id);
-                            if (comp != null) {
-                                String name = extractNameFromItemComposition(client, comp, id);
-                                if (name != null) {
-                                    ITEM_NAME_CACHE.put(id, name);
-                                    return name;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                } catch (Throwable ignored) {}
-            }
-        }
-
-        // 3. Built-in item lookup dictionary
-        String builtin = getBuiltinItemName(id);
-        if (builtin != null) {
-            ITEM_NAME_CACHE.put(id, builtin);
-            return builtin;
-        }
-
-        return null;
-    }
-
-    private static String extractNameFromItemComposition(Object client, Object comp, int originalId) {
-        if (comp == null) return null;
-
-        // Try direct name methods
-        for (String nmMethod : new String[]{"getName", "getMembersName", "getRawName"}) {
-            try {
-                Method getName = comp.getClass().getMethod(nmMethod);
-                getName.setAccessible(true);
-                Object n = getName.invoke(comp);
-                if (n instanceof String) {
-                    String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                    if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none")) {
-                        return s;
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // Try any zero-parameter String-returning method with 'name'
-        for (Method m : comp.getClass().getMethods()) {
-            if (m.getParameterCount() == 0 && m.getReturnType() == String.class) {
-                String mName = m.getName().toLowerCase();
-                if (mName.contains("name")) {
-                    try {
-                        m.setAccessible(true);
-                        Object n = m.invoke(comp);
-                        if (n instanceof String) {
-                            String s = ((String) n).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                            if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none")) {
-                                return s;
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            }
-        }
-
-        // Check if this is a noted item and resolve linked unnoted item
-        for (String mName : new String[]{"getLinkedNoteId", "getNote", "getUnnotedId"}) {
-            try {
-                Method m = comp.getClass().getMethod(mName);
-                m.setAccessible(true);
-                Object res = m.invoke(comp);
-                if (res instanceof Integer) {
-                    int linkedId = (Integer) res;
-                    if (linkedId > 0 && linkedId != originalId) {
-                        String unnotedName = resolveItemName(client, linkedId);
-                        if (unnotedName != null && !unnotedName.isEmpty()) {
-                            return unnotedName;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // Check if placeholder and resolve base item
-        for (String mName : new String[]{"getPlaceholderId", "getPlaceholderTemplateId"}) {
-            try {
-                Method m = comp.getClass().getMethod(mName);
-                m.setAccessible(true);
-                Object res = m.invoke(comp);
-                if (res instanceof Integer) {
-                    int placeholderId = (Integer) res;
-                    if (placeholderId > 0 && placeholderId != originalId) {
-                        String baseName = resolveItemName(client, placeholderId);
-                        if (baseName != null && !baseName.isEmpty()) {
-                            return baseName;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // Search all fields in inheritance hierarchy
-        Class<?> curr = comp.getClass();
-        while (curr != null && curr != Object.class) {
-            for (Field f : curr.getDeclaredFields()) {
-                if (f.getType() == String.class) {
-                    try {
-                        f.setAccessible(true);
-                        Object res = f.get(comp);
-                        if (res instanceof String) {
-                            String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                            if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("none") && s.length() > 1) {
-                                return s;
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            }
-            curr = curr.getSuperclass();
-        }
-        return null;
-    }
-
-    private static String getBuiltinItemName(int id) {
-        switch (id) {
-            case 995: return "Coins";
-            case 1351: return "Bronze axe";
-            case 1349: return "Iron axe";
-            case 1353: return "Steel axe";
-            case 1355: return "Mithril axe";
-            case 1357: return "Adamant axe";
-            case 1359: return "Rune axe";
-            case 6739: return "Dragon axe";
-            case 1265: return "Bronze pickaxe";
-            case 1267: return "Iron pickaxe";
-            case 1269: return "Steel pickaxe";
-            case 1273: return "Mithril pickaxe";
-            case 1271: return "Adamant pickaxe";
-            case 1275: return "Rune pickaxe";
-            case 11920: return "Dragon pickaxe";
-            case 303: return "Small fishing net";
-            case 307: return "Fishing rod";
-            case 309: return "Fly fishing rod";
-            case 311: return "Harpoon";
-            case 301: return "Lobster pot";
-            case 313: return "Fishing bait";
-            case 314: return "Feather";
-            case 590: return "Tinderbox";
-            case 1755: return "Chisel";
-            case 2347: return "Hammer";
-            case 1733: return "Needle";
-            case 1734: return "Thread";
-            case 946: return "Knife";
-            case 1925: return "Bucket";
-            case 1929: return "Bucket of water";
-            case 1935: return "Jug";
-            case 1937: return "Jug of water";
-            case 227: return "Vial of water";
-            case 229: return "Vial";
-            case 554: return "Fire rune";
-            case 555: return "Water rune";
-            case 556: return "Air rune";
-            case 557: return "Earth rune";
-            case 558: return "Mind rune";
-            case 559: return "Body rune";
-            case 560: return "Death rune";
-            case 561: return "Nature rune";
-            case 562: return "Chaos rune";
-            case 563: return "Law rune";
-            case 564: return "Cosmic rune";
-            case 565: return "Blood rune";
-            case 566: return "Soul rune";
-            case 21880: return "Wrath rune";
-            case 9075: return "Astral rune";
-            case 315: return "Shrimps";
-            case 325: return "Salmon";
-            case 329: return "Salmon";
-            case 333: return "Trout";
-            case 377: return "Lobster";
-            case 379: return "Lobster";
-            case 383: return "Raw shark";
-            case 385: return "Shark";
-            case 386: return "Shark (noted)";
-            case 395: case 397: return "Sea turtle";
-            case 389: case 391: return "Manta ray";
-            case 3144: return "Cooked karambwan";
-            case 13441: return "Anglerfish";
-            case 11936: return "Dark crab";
-            case 7946: return "Monkfish";
-            case 2434: case 139: case 141: case 143: return "Prayer potion";
-            case 6685: case 6687: case 6689: case 6691: return "Saradomin brew";
-            case 3024: case 3026: case 3028: case 3030: return "Super restore";
-            case 12625: case 12627: case 12629: case 12631: return "Stamina potion";
-            case 2440: case 157: case 159: case 161: return "Super strength";
-            case 2436: case 145: case 147: case 149: return "Super attack";
-            case 2442: case 163: case 165: case 167: return "Super defence";
-            case 2444: case 169: case 171: case 173: return "Ranging potion";
-            case 3040: case 3042: case 3044: case 3046: return "Magic potion";
-            case 12695: case 12697: case 12699: case 12701: return "Super combat potion";
-            case 23685: case 23688: case 23691: case 23694: return "Divine super combat potion";
-            case 4151: return "Abyssal whip";
-            case 12006: return "Abyssal tentacle";
-            case 1305: return "Dragon longsword";
-            case 4587: return "Dragon scimitar";
-            case 1377: return "Dragon battleaxe";
-            case 1215: case 5698: return "Dragon dagger";
-            case 11802: return "Armadyl godsword";
-            case 11804: return "Bandos godsword";
-            case 11806: return "Saradomin godsword";
-            case 11808: return "Zamorak godsword";
-            case 11832: return "Bandos chestplate";
-            case 11834: return "Bandos tassets";
-            case 11836: return "Bandos boots";
-            case 11826: return "Armadyl helmet";
-            case 11828: return "Armadyl chestplate";
-            case 11830: return "Armadyl chainskirt";
-            case 11840: return "Dragon boots";
-            case 21736: return "Primordial boots";
-            case 21742: return "Pegasian boots";
-            case 21748: return "Eternal boots";
-            case 6585: return "Amulet of fury";
-            case 19553: return "Amulet of torture";
-            case 19547: return "Necklace of anguish";
-            case 19544: return "Tormented bracelet";
-            case 19550: return "Ring of suffering";
-            case 1704: case 1712: case 11978: return "Amulet of glory";
-            case 1725: return "Amulet of strength";
-            case 1727: return "Amulet of magic";
-            case 1731: return "Amulet of power";
-            case 6737: case 11773: return "Berserker ring";
-            case 6731: case 11770: return "Seers ring";
-            case 6733: case 11771: return "Archers ring";
-            case 6735: case 11772: return "Warrior ring";
-            case 22975: return "Brimstone ring";
-            case 7462: return "Barrows gloves";
-            case 7461: return "Dragon gloves";
-            case 7460: return "Rune gloves";
-            case 10551: return "Fighter torso";
-            case 1127: return "Rune platebody";
-            case 1079: return "Rune platelegs";
-            case 1093: return "Rune plateskirt";
-            case 1163: return "Rune full helm";
-            case 1201: return "Rune kiteshield";
-            case 3140: return "Dragon chainbody";
-            case 4087: return "Dragon platelegs";
-            case 4585: return "Dragon plateskirt";
-            case 1149: return "Dragon med helm";
-            case 11838: case 12954: return "Dragon defender";
-            case 8850: return "Rune defender";
-            case 12926: case 12924: return "Toxic blowpipe";
-            case 12934: return "Zulrah's scales";
-            case 11283: return "Dragonfire shield";
-            case 10499: return "Ava's accumulator";
-            case 22109: return "Ava's assembler";
-            case 25865: case 25867: return "Bow of faerdhinen";
-            case 20997: return "Twisted bow";
-            case 22325: return "Scythe of vitur";
-            case 27275: return "Tumeken's shadow";
-            case 4716: return "Dharok's helm";
-            case 4718: return "Dharok's greataxe";
-            case 4720: return "Dharok's platebody";
-            case 4722: return "Dharok's platelegs";
-            case 4708: return "Ahrim's hood";
-            case 4710: return "Ahrim's staff";
-            case 4712: return "Ahrim's robetop";
-            case 4714: return "Ahrim's robeskirt";
-            case 4724: return "Guthan's helm";
-            case 4726: return "Guthan's warspear";
-            case 4728: return "Guthan's platebody";
-            case 4730: return "Guthan's chainskirt";
-            case 4732: return "Karil's coif";
-            case 4734: return "Karil's crossbow";
-            case 4736: return "Karil's leathertop";
-            case 4738: return "Karil's leatherskirt";
-            case 4745: return "Torag's helm";
-            case 4747: return "Torag's hammers";
-            case 4749: return "Torag's platebody";
-            case 4751: return "Torag's platelegs";
-            case 4753: return "Verac's helm";
-            case 4755: return "Verac's flail";
-            case 4757: return "Verac's brassard";
-            case 4759: return "Verac's plateskirt";
-            case 11864: case 11865: return "Slayer helmet";
-            case 6570: return "Fire cape";
-            case 21295: return "Infernal cape";
-            case 13280: return "Max cape";
-            case 436: return "Copper ore";
-            case 438: return "Tin ore";
-            case 440: return "Iron ore";
-            case 442: return "Silver ore";
-            case 444: return "Gold ore";
-            case 447: return "Mithril ore";
-            case 449: return "Adamantite ore";
-            case 451: return "Runite ore";
-            case 453: return "Coal";
-            case 2349: return "Bronze bar";
-            case 2351: return "Iron bar";
-            case 2353: return "Steel bar";
-            case 2355: return "Silver bar";
-            case 2357: return "Gold bar";
-            case 2359: return "Mithril bar";
-            case 2361: return "Adamantite bar";
-            case 2363: return "Runite bar";
-            case 1511: return "Logs";
-            case 1521: return "Oak logs";
-            case 1519: return "Willow logs";
-            case 6333: return "Teak logs";
-            case 1517: return "Maple logs";
-            case 6332: return "Mahogany logs";
-            case 1515: return "Yew logs";
-            case 1513: return "Magic logs";
-            case 19669: return "Redwood logs";
-            case 526: return "Bones";
-            case 532: return "Big bones";
-            case 536: return "Dragon bones";
-            case 22124: return "Superior dragon bones";
-            case 199: return "Grimy guam leaf";
-            case 201: return "Grimy marrentill";
-            case 203: return "Grimy tarromin";
-            case 205: return "Grimy harralander";
-            case 207: return "Grimy ranarr weed";
-            case 209: return "Grimy irit leaf";
-            case 211: return "Grimy avantoe";
-            case 213: return "Grimy kwuarm";
-            case 215: return "Grimy cadantine";
-            case 217: return "Grimy dwarf weed";
-            case 219: return "Grimy torstol";
-            case 3049: return "Grimy toadflax";
-            case 3051: return "Grimy snapdragon";
-            case 8007: return "Varrock teleport";
-            case 8008: return "Lumbridge teleport";
-            case 8009: return "Falador teleport";
-            case 8010: return "Camelot teleport";
-            case 8011: return "Ardougne teleport";
-            case 8013: return "Teleport to house";
-            case 2412: return "Saradomin cape";
-            case 2413: return "Guthix cape";
-            case 2414: return "Zamorak cape";
-            case 21791: return "Imbued saradomin cape";
-            case 21793: return "Imbued guthix cape";
-            case 21795: return "Imbued zamorak cape";
-            case 11850: return "Graceful hood";
-            case 11852: return "Graceful cape";
-            case 11854: return "Graceful top";
-            case 11856: return "Graceful legs";
-            case 11858: return "Graceful gloves";
-            case 11860: return "Graceful boots";
-            case 8839: return "Void knight top";
-            case 8840: return "Void knight robe";
-            case 8842: return "Void knight gloves";
-            case 11663: return "Void mage helm";
-            case 11664: return "Void ranger helm";
-            case 11665: return "Void melee helm";
-            case 13072: return "Elite void top";
-            case 13073: return "Elite void robe";
-            case 12791: return "Rune pouch";
-            case 27281: return "Divine rune pouch";
-            case 12940: return "Toxic staff of the dead";
-            case 12904: return "Toxic staff (uncharged)";
-            case 12929: return "Serpentine helm (uncharged)";
-            case 12931: return "Serpentine helm";
-            case 13239: return "Primordial boots";
-            case 13237: return "Pegasian boots";
-            case 13235: return "Eternal boots";
-            case 22978: return "Brimstone ring";
-            case 20653: return "Amulet of the damned";
-            case 20655: return "Amulet of the damned (full)";
-            case 2452: return "Antifire potion(4)";
-            case 2454: return "Antifire potion(3)";
-            case 2456: return "Antifire potion(2)";
-            case 2458: return "Antifire potion(1)";
-            case 11951: return "Extended antifire(4)";
-            case 11953: return "Extended antifire(3)";
-            case 11955: return "Extended antifire(2)";
-            case 11957: return "Extended antifire(1)";
-            case 22209: return "Extended super antifire(4)";
-            case 22212: return "Extended super antifire(3)";
-            case 22215: return "Extended super antifire(2)";
-            case 22218: return "Extended super antifire(1)";
-            case 2446: return "Antipoison(4)";
-            case 175: return "Antipoison(3)";
-            case 177: return "Antipoison(2)";
-            case 179: return "Antipoison(1)";
-            case 2448: return "Superantipoison(4)";
-            case 181: return "Superantipoison(3)";
-            case 183: return "Superantipoison(2)";
-            case 185: return "Superantipoison(1)";
-            case 5952: return "Antidote+(4)";
-            case 5954: return "Antidote+(3)";
-            case 5956: return "Antidote+(2)";
-            case 5958: return "Antidote+(1)";
-            case 5943: return "Antidote++(4)";
-            case 5945: return "Antidote++(3)";
-            case 5947: return "Antidote++(2)";
-            case 5949: return "Antidote++(1)";
-            case 12913: return "Anti-venom(4)";
-            case 12915: return "Anti-venom(3)";
-            case 12917: return "Anti-venom(2)";
-            case 12919: return "Anti-venom(1)";
-            case 12905: return "Anti-venom+(4)";
-            case 12907: return "Anti-venom+(3)";
-            case 12909: return "Anti-venom+(2)";
-            case 12911: return "Anti-venom+(1)";
-            default: return null;
-        }
-    }
-
-    private static void appendRuneLitePlayer(Object client, Object player, int index, int playerX, int playerY, Object localPlayer, StringBuilder data) {
-        try {
-            int id = index;
-            int dist = 0;
-            int combatLevel = 0;
-            String name = "Unknown";
-
-            try {
-                Method getId = player.getClass().getMethod("getId");
-                getId.setAccessible(true);
-                id = (Integer) getId.invoke(player);
-            } catch (Throwable ignored) {}
-
-            try {
-                Method getName = player.getClass().getMethod("getName");
-                getName.setAccessible(true);
-                Object res = getName.invoke(player);
-                if (res instanceof String) {
-                    name = ((String) res).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
-                }
-            } catch (Throwable ignored) {}
-
-            if (name.isEmpty() || name.equalsIgnoreCase("null")) {
-                name = "Player " + (index + 1);
-            }
-
-            if (player != null && localPlayer != null && player.equals(localPlayer)) {
-                name = name + " (You)";
-            }
-
-            try {
-                Method getCombatLevel = player.getClass().getMethod("getCombatLevel");
-                getCombatLevel.setAccessible(true);
-                combatLevel = (Integer) getCombatLevel.invoke(player);
-            } catch (Throwable ignored) {}
-
-            try {
-                Method getWorldLocation = player.getClass().getMethod("getWorldLocation");
-                getWorldLocation.setAccessible(true);
-                Object wp = getWorldLocation.invoke(player);
-                if (wp != null && playerX > 0 && playerY > 0) {
-                    Method getX = wp.getClass().getMethod("getX");
-                    Method getY = wp.getClass().getMethod("getY");
-                    getX.setAccessible(true);
-                    getY.setAccessible(true);
-                    int px = (Integer) getX.invoke(wp);
-                    int py = (Integer) getY.invoke(wp);
-                    dist = Math.max(Math.abs(px - playerX), Math.abs(py - playerY));
-                } else {
-                    Method getLocalLoc = player.getClass().getMethod("getLocalLocation");
-                    getLocalLoc.setAccessible(true);
-                    Object loc = getLocalLoc.invoke(player);
-                    if (loc != null && localPlayer != null) {
-                        Method getLocalPlayerLoc = localPlayer.getClass().getMethod("getLocalLocation");
-                        getLocalPlayerLoc.setAccessible(true);
-                        Object myLoc = getLocalPlayerLoc.invoke(localPlayer);
-                        if (myLoc != null) {
-                            Method getX = loc.getClass().getMethod("getX");
-                            Method getY = loc.getClass().getMethod("getY");
-                            getX.setAccessible(true);
-                            getY.setAccessible(true);
-                            int lx = (Integer) getX.invoke(loc);
-                            int ly = (Integer) getY.invoke(loc);
-                            int myX = (Integer) getX.invoke(myLoc);
-                            int myY = (Integer) getY.invoke(myLoc);
-                            dist = Math.max(Math.abs((lx >> 7) - (myX >> 7)), Math.abs((ly >> 7) - (myY >> 7)));
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
-
-            data.append("NEARBY_PLAYER[").append(index).append("]: ").append(id).append(",").append(name).append(",").append(dist).append(",").append(combatLevel).append("\n");
-        } catch (Throwable ignored) {}
-    }
-
-    private static String extractPlayerName(Object player) {
-        if (player == null) return "Unknown";
-        try {
-            Method getName = player.getClass().getMethod("getName");
-            getName.setAccessible(true);
-            Object res = getName.invoke(player);
-            if (res instanceof String) {
-                String s = ((String) res).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
-                if (!s.isEmpty() && !s.equalsIgnoreCase("null")) return s;
-            }
-        } catch (Throwable ignored) {}
-        for (Field f : player.getClass().getDeclaredFields()) {
-            if (f.getType() == String.class) {
-                try {
-                    f.setAccessible(true);
-                    Object res = f.get(player);
-                    if (res instanceof String) {
-                        String s = ((String) res).replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
-                        if (!s.isEmpty() && !s.equalsIgnoreCase("null") && s.length() > 1) return s;
-                    }
-                } catch (Throwable ignored) {}
-            }
-        }
-        return "Player";
-    }
-
-    private static void appendRuneLiteNpc(Object client, Object npc, int index, int playerX, int playerY, StringBuilder data) {
-        try {
-            int id = -1;
-            int dist = 0;
-            String health = "100%";
-
-            try {
-                Method getId = npc.getClass().getMethod("getId");
-                getId.setAccessible(true);
-                id = (Integer) getId.invoke(npc);
-            } catch (Throwable ignored) {}
-
-            String name = extractNpcName(client, npc, id);
-
-            try {
-                Method getWorldLocation = npc.getClass().getMethod("getWorldLocation");
-                getWorldLocation.setAccessible(true);
-                Object wp = getWorldLocation.invoke(npc);
-                if (wp != null && playerX > 0 && playerY > 0) {
-                    Method getX = wp.getClass().getMethod("getX");
-                    Method getY = wp.getClass().getMethod("getY");
-                    getX.setAccessible(true);
-                    getY.setAccessible(true);
-                    int nx = (Integer) getX.invoke(wp);
-                    int ny = (Integer) getY.invoke(wp);
-                    dist = Math.max(Math.abs(nx - playerX), Math.abs(ny - playerY));
-                } else {
-                    Method getLocalLoc = npc.getClass().getMethod("getLocalLocation");
-                    getLocalLoc.setAccessible(true);
-                    Object loc = getLocalLoc.invoke(npc);
-                    if (loc != null && client != null) {
-                        try {
-                            Method getLocalPlayer = client.getClass().getMethod("getLocalPlayer");
-                            getLocalPlayer.setAccessible(true);
-                            Object lp = getLocalPlayer.invoke(client);
-                            if (lp != null) {
-                                Method getLocalPlayerLoc = lp.getClass().getMethod("getLocalLocation");
-                                getLocalPlayerLoc.setAccessible(true);
-                                Object myLoc = getLocalPlayerLoc.invoke(lp);
-                                if (myLoc != null) {
-                                    Method getX = loc.getClass().getMethod("getX");
-                                    Method getY = loc.getClass().getMethod("getY");
-                                    getX.setAccessible(true);
-                                    getY.setAccessible(true);
-                                    int nx = (Integer) getX.invoke(loc);
-                                    int ny = (Integer) getY.invoke(loc);
-                                    int myX = (Integer) getX.invoke(myLoc);
-                                    int myY = (Integer) getY.invoke(myLoc);
-                                    dist = Math.max(Math.abs((nx >> 7) - (myX >> 7)), Math.abs((ny >> 7) - (myY >> 7)));
-                                }
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                }
-            } catch (Throwable ignored) {}
-
-            try {
-                Method getHealthRatio = npc.getClass().getMethod("getHealthRatio");
-                Method getHealthScale = npc.getClass().getMethod("getHealthScale");
-                getHealthRatio.setAccessible(true);
-                getHealthScale.setAccessible(true);
-                int ratio = (Integer) getHealthRatio.invoke(npc);
-                int scale = (Integer) getHealthScale.invoke(npc);
-                if (scale > 0 && ratio >= 0) {
-                    health = (ratio * 100 / scale) + "%";
-                }
-            } catch (Throwable ignored) {}
-
-            String category = categorizeNpc(name);
-            data.append("NPC[").append(index).append("]: ").append(id).append(",").append(name).append(",").append(dist).append(",").append(health).append(",").append(category).append("\n");
-        } catch (Throwable ignored) {}
-    }
-
-    private static String extractNpcName(Object client, Object npc, int id) {
-        if (npc == null) return "Unknown";
-
-        // Strategy 1: Direct getName() on npc
-        try {
-            Method getName = npc.getClass().getMethod("getName");
-            getName.setAccessible(true);
-            Object res = getName.invoke(npc);
-            if (res instanceof String) {
-                String s = (String) res;
-                if (isValidNpcName(s)) return cleanNpcName(s);
-            }
-        } catch (Throwable ignored) {}
-
-        // Strategy 2: Via composition or definition
-        String[] compMethods = {"getComposition", "getTransformedComposition", "getDefinition", "npcComposition"};
-        for (String cMethod : compMethods) {
-            try {
-                Method getComp = npc.getClass().getMethod(cMethod);
-                getComp.setAccessible(true);
-                Object comp = getComp.invoke(npc);
-                if (comp != null) {
-                    try {
-                        Method compGetName = comp.getClass().getMethod("getName");
-                        compGetName.setAccessible(true);
-                        Object res = compGetName.invoke(comp);
-                        if (res instanceof String) {
-                            String s = (String) res;
-                            if (isValidNpcName(s)) return cleanNpcName(s);
-                        }
-                    } catch (Throwable ignored) {}
-
-                    for (Field f : comp.getClass().getDeclaredFields()) {
-                        if (f.getType() == String.class) {
-                            f.setAccessible(true);
-                            Object res = f.get(comp);
-                            if (res instanceof String) {
-                                String s = (String) res;
-                                if (isValidNpcName(s)) return cleanNpcName(s);
-                            }
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // Strategy 3: Check declared fields on NPC object
-        for (Field f : npc.getClass().getDeclaredFields()) {
-            try {
-                f.setAccessible(true);
-                Object val = f.get(npc);
-                if (val != null) {
-                    if (val instanceof String) {
-                        String s = (String) val;
-                        if (isValidNpcName(s)) return cleanNpcName(s);
-                    } else if (!f.getType().isPrimitive()) {
-                        try {
-                            Method compGetName = val.getClass().getMethod("getName");
-                            compGetName.setAccessible(true);
-                            Object res = compGetName.invoke(val);
-                            if (res instanceof String) {
-                                String s = (String) res;
-                                if (isValidNpcName(s)) return cleanNpcName(s);
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // Strategy 4: Query client for NPC definition by id
-        if (client != null && id > 0) {
-            String[] clientDefMethods = {"getNpcDefinition", "getNpcComposition", "loadNPCComposition"};
-            for (String mName : clientDefMethods) {
-                try {
-                    Method m = client.getClass().getMethod(mName, int.class);
-                    m.setAccessible(true);
-                    Object comp = m.invoke(client, id);
-                    if (comp != null) {
-                        try {
-                            Method compGetName = comp.getClass().getMethod("getName");
-                            compGetName.setAccessible(true);
-                            Object res = compGetName.invoke(comp);
-                            if (res instanceof String) {
-                                String s = (String) res;
-                                if (isValidNpcName(s)) return cleanNpcName(s);
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                } catch (Throwable ignored) {}
-            }
-        }
-
-        return id > 0 ? "NPC_" + id : "Unknown";
-    }
-
-    private static boolean isValidNpcName(String s) {
-        if (s == null) return false;
-        String t = s.trim();
-        return !t.isEmpty() && !t.equalsIgnoreCase("null") && !t.equalsIgnoreCase("null-name") && !t.equalsIgnoreCase("Unknown") && t.length() < 60;
-    }
-
-    private static String cleanNpcName(String s) {
-        return s.replace('\u00A0', ' ').replaceAll("<[^>]*>", "").trim();
-    }
-
-    private static String categorizeNpc(String name) {
-        if (name == null) return "NPC";
-        String n = name.toLowerCase();
-        if (n.contains("fishing spot") || n.contains("rod fishing spot") || n.contains("cage fishing spot") ||
-            n.contains("net fishing spot") || n.contains("harpoon fishing spot") || n.contains("lava fishing spot") ||
-            n.contains("cave eel fishing spot") || n.equals("fishing spot")) {
-            return "Fishing Spot";
-        }
-        if (n.equals("turael") || n.equals("spria") || n.equals("krystilia") || n.equals("mazchna") ||
-            n.equals("vannaka") || n.equals("chaeldar") || n.contains("konar") || n.equals("nieve") ||
-            n.equals("steve") || n.equals("duradel") || n.equals("kuradal") || n.contains("slayer master")) {
-            return "Slayer Master";
-        }
-        if (n.contains("banker") || n.contains("bank") || n.equals("emerald benedict") || n.equals("ghost banker") || n.contains("gnome banker")) {
-            return "Banker";
-        }
-        if (n.contains("shopkeeper") || n.contains("assistant") || n.contains("merchant") || n.contains("trader") ||
-            n.contains("general store") || n.equals("apothecary") || n.equals("horvik") || n.equals("zaff") ||
-            n.equals("thessalia") || n.equals("lowe") || n.equals("brian") || n.equals("cassie") || n.equals("wyd") ||
-            n.equals("grum") || n.equals("garrad") || n.equals("aubury") || n.equals("herquin")) {
-            return "Shopkeeper";
-        }
-        if (n.contains("grand exchange clerk") || n.contains("exchange clerk") || n.contains("ge clerk")) {
-            return "Grand Exchange";
-        }
-        return "NPC";
-    }
-
-    private static boolean isFishingSpotNpc(Object client, Object npc) {
-        if (npc == null) return false;
-        try {
-            int id = -1;
-            try {
-                Method getId = npc.getClass().getMethod("getId");
-                getId.setAccessible(true);
-                id = (Integer) getId.invoke(npc);
-            } catch (Throwable ignored) {}
-            String name = extractNpcName(client, npc, id);
-            if (name != null) {
-                String n = name.toLowerCase();
-                if (n.contains("fishing spot") || n.contains("rod fishing spot") || n.contains("cage fishing spot") ||
-                    n.contains("net fishing spot") || n.contains("harpoon fishing spot") || n.contains("lava fishing spot") ||
-                    n.contains("cave eel fishing spot") || n.equals("fishing spot")) {
-                    return true;
-                }
-            }
-            if ((id >= 1510 && id <= 1534) || (id >= 1542 && id <= 1544) || id == 4316 || (id >= 4712 && id <= 4714) ||
-                id == 6825 || id == 6488 || id == 7676 || (id >= 7730 && id <= 7733) || (id >= 8523 && id <= 8527)) {
-                return true;
-            }
-        } catch (Throwable ignored) {}
-        return false;
-    }
-
-    private static void appendRuneLiteFishingSpot(Object client, Object npc, int index, int playerX, int playerY, StringBuilder data) {
-        if (npc == null) return;
-        try {
-            int id = -1;
-            try {
-                Method getId = npc.getClass().getMethod("getId");
-                getId.setAccessible(true);
-                id = (Integer) getId.invoke(npc);
-            } catch (Throwable ignored) {}
-
-            String name = extractNpcName(client, npc, id);
-            String spotType = resolveFishingSpotType(name, npc, id);
-
-            int dist = 0;
-            int nx = playerX;
-            int ny = playerY;
-            try {
-                Method getWorldLocation = npc.getClass().getMethod("getWorldLocation");
-                getWorldLocation.setAccessible(true);
-                Object wp = getWorldLocation.invoke(npc);
-                if (wp != null && playerX > 0 && playerY > 0) {
-                    Method getX = wp.getClass().getMethod("getX");
-                    Method getY = wp.getClass().getMethod("getY");
-                    getX.setAccessible(true);
-                    getY.setAccessible(true);
-                    nx = (Integer) getX.invoke(wp);
-                    ny = (Integer) getY.invoke(wp);
-                    dist = Math.max(Math.abs(nx - playerX), Math.abs(ny - playerY));
-                }
-            } catch (Throwable ignored) {}
-
-            data.append("FISHING_SPOT[").append(index).append("]: ")
-                .append(id).append(",")
-                .append(name).append(",")
-                .append(spotType).append(",")
-                .append(dist).append(",")
-                .append(nx).append(",")
-                .append(ny).append("\n");
-        } catch (Throwable ignored) {}
-    }
-
-    private static String resolveFishingSpotType(String name, Object npc, int id) {
-        String n = name != null ? name.toLowerCase() : "";
-        if (npc != null) {
-            try {
-                Method getActions = null;
-                for (String mName : new String[]{"getActions", "actions"}) {
-                    try {
-                        getActions = npc.getClass().getMethod(mName);
-                        break;
-                    } catch (Throwable ignored) {}
-                }
-                if (getActions != null) {
-                    getActions.setAccessible(true);
-                    Object actionsObj = getActions.invoke(npc);
-                    if (actionsObj instanceof String[]) {
-                        String[] actions = (String[]) actionsObj;
-                        boolean hasCage = false, hasHarpoon = false, hasNet = false, hasBait = false, hasLure = false, hasSmallNet = false;
-                        for (String a : actions) {
-                            if (a != null) {
-                                String act = a.toLowerCase();
-                                if (act.contains("cage")) hasCage = true;
-                                if (act.contains("harpoon")) hasHarpoon = true;
-                                if (act.contains("small net") || act.contains("small-net")) hasSmallNet = true;
-                                else if (act.contains("net")) hasNet = true;
-                                if (act.contains("bait")) hasBait = true;
-                                if (act.contains("lure")) hasLure = true;
-                            }
-                        }
-                        if (hasCage && hasHarpoon) return "Lobster / Swordfish (Cage / Harpoon)";
-                        if (hasLure && hasBait) return "Trout / Salmon / Pike (Lure / Bait)";
-                        if (hasSmallNet) return "Monkfish / Minnows (Small Net)";
-                        if (hasNet && hasBait) return "Shrimp / Anchovies (Net / Bait)";
-                        if (hasHarpoon) return "Shark / Tuna (Harpoon)";
-                        if (hasLure) return "Trout / Salmon (Fly Fishing)";
-                        if (hasCage) return "Lobster (Lobster Pot)";
-                        if (hasNet) return "Shrimp / Anchovies (Small Net)";
-                        if (hasBait) return "Sardine / Herring / Karambwan (Bait)";
-                    }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        if (id == 1518 || id == 1526 || id == 1527 || n.contains("rod")) return "Trout / Salmon / Pike (Fly Fishing / Bait)";
-        if (id == 1510 || id == 1519 || id == 1522 || n.contains("cage")) return "Lobster / Swordfish (Cage / Harpoon)";
-        if (id == 1511 || id == 1520 || id == 1534 || n.contains("harpoon")) return "Shark / Tuna (Harpoon)";
-        if (id == 4316) return "Monkfish (Small Net)";
-        if (id == 4712 || id == 4713 || id == 4714) return "Karambwan (Karambwan Vessel)";
-        if (id == 6825) return "Anglerfish (Sandworm / Bait)";
-        if (id == 6488) return "Sacred Eel (Bait)";
-        if (id == 7676) return "Infernal Eel (Oily Rod / Bait)";
-        if (id >= 7730 && id <= 7733) return "Minnows (Small Net)";
-        if (id == 1542 || id == 1544) return "Barbarian Fishing (Heavy Rod)";
-        if (id >= 8523 && id <= 8527) return "Aerial Fishing (Bird)";
-        if (n.contains("net")) return "Shrimp / Anchovies (Small Net)";
-        if (n.contains("lava")) return "Lava Eel (Oily Rod)";
-        if (n.contains("cave eel")) return "Cave Eel (Bait)";
-        return "Fish (Net / Bait / Harpoon)";
-    }
-
-    // -------------------------------------------------------------
-    // Special Attack Detection
-    // -------------------------------------------------------------
-    private static void processRuneLiteSpecialAttack(Object client, StringBuilder data) {
-        if (client == null) return;
-        try {
-            int specEnergy = getVarpValue(client, 300); // 0 - 1000 (1000 = 100%)
-            int specActive = getVarpValue(client, 301); // 1 = active / enabled
-            if (specEnergy >= 0) {
-                int percent = specEnergy / 10;
-                data.append("SPECIAL_ATTACK_PERCENT: ").append(percent).append("%\n");
-                data.append("SPECIAL_ATTACK_ACTIVE: ").append(specActive == 1 ? "Active" : "Inactive").append("\n");
-            }
-        } catch (Throwable ignored) {}
-    }
-
-    // -------------------------------------------------------------
-    // Slayer Task & Master Detection
-    // -------------------------------------------------------------
-    private static void processRuneLiteSlayer(Object client, StringBuilder data) {
-        if (client == null) return;
-        try {
-            int taskCount = getVarbitValue(client, 394);
-            int creatureId = getVarbitValue(client, 395);
-            if (creatureId < 0) {
-                int varp261 = getVarpValue(client, 261);
-                if (varp261 > 0) creatureId = varp261;
-            }
-            int slayerPoints = getVarbitValue(client, 4068);
-            int slayerStreak = getVarbitValue(client, 4067);
-
-            String taskMonster = resolveSlayerMonster(creatureId);
-            if (taskCount > 0 && !taskMonster.equals("None")) {
-                data.append("SLAYER_COUNT: ").append(taskCount).append("\n");
-                data.append("SLAYER_TASK: ").append(taskMonster).append("\n");
-            } else if (taskCount == 0) {
-                data.append("SLAYER_COUNT: 0\n");
-                data.append("SLAYER_TASK: None\n");
-            }
-
-            if (slayerPoints >= 0) {
-                data.append("SLAYER_POINTS: ").append(slayerPoints).append("\n");
-            }
-            if (slayerStreak >= 0) {
-                data.append("SLAYER_STREAK: ").append(slayerStreak).append("\n");
-            }
-        } catch (Throwable ignored) {}
-    }
-
-    private static String resolveSlayerMonster(int id) {
-        switch (id) {
-            case 1: return "Monkeys";
-            case 2: return "Goblins";
-            case 3: return "Rats";
-            case 4: return "Spiders";
-            case 5: return "Birds";
-            case 6: return "Cows";
-            case 7: return "Scorpions";
-            case 8: return "Bats";
-            case 9: return "Wolves";
-            case 10: return "Zombies";
-            case 11: return "Skeletons";
-            case 12: return "Ghosts";
-            case 13: return "Bears";
-            case 14: return "Hill Giants";
-            case 15: return "Ice Giants";
-            case 16: return "Moss Giants";
-            case 17: return "Fire Giants";
-            case 18: return "Cave Bugs";
-            case 19: return "Cave Crawlers";
-            case 20: return "Crawling Hands";
-            case 21: return "Cave Slimes";
-            case 22: return "Banshees";
-            case 23: return "Infernal Mages";
-            case 24: return "Bloodvelds";
-            case 25: return "Aberrant Spectres";
-            case 26: return "Gargoyles";
-            case 27: return "Nechryael";
-            case 28: return "Abyssal Demons";
-            case 29: return "Basilisks";
-            case 30: return "Cockatrice";
-            case 31: return "Kurask";
-            case 32: return "Dust Devils";
-            case 33: return "Spiritual Creatures";
-            case 34: return "Turoth";
-            case 35: return "Dark Beasts";
-            case 36: return "Cave Krakens";
-            case 37: return "Smoke Devils";
-            case 38: return "Wyrms";
-            case 39: return "Drakes";
-            case 40: return "Hydras";
-            case 41: return "Greater Demons";
-            case 42: return "Lesser Demons";
-            case 43: return "Black Demons";
-            case 44: return "Hellhounds";
-            case 45: return "Blue Dragons";
-            case 46: return "Red Dragons";
-            case 47: return "Black Dragons";
-            case 48: return "Iron Dragons";
-            case 49: return "Steel Dragons";
-            case 50: return "Mithril Dragons";
-            case 51: return "Adamant Dragons";
-            case 52: return "Rune Dragons";
-            case 53: return "Aviansies";
-            case 54: return "Dagannoth";
-            case 55: return "Kalphite";
-            case 56: return "Ankou";
-            case 57: return "TzHaar";
-            case 58: return "Suqahs";
-            case 59: return "Mutated Zygomites";
-            case 60: return "Fossil Island Wyverns";
-            case 61: return "Basilisk Knights";
-            case 62: return "Lizardmen";
-            case 63: return "Vampyres";
-            case 64: return "Brine Rats";
-            case 65: return "Cave Horrors";
-            case 66: return "Elves";
-            case 67: return "Dwarves";
-            case 68: return "Minotaurs";
-            case 69: return "Fever Spiders";
-            case 70: return "Harpie Bug Swarms";
-            case 71: return "Sea Snakes";
-            case 72: return "Mogres";
-            case 73: return "Desert Lizards";
-            case 74: return "Jungle Horrors";
-            case 75: return "Zygomites";
-            case 76: return "Icefiends";
-            case 77: return "Minions of Scabaras";
-            case 78: return "Terror Dogs";
-            case 79: return "Molanisks";
-            case 80: return "Waterfiends";
-            case 81: return "Warped Terrorbirds";
-            case 82: return "Warped Tortoises";
-            case 83: return "Spiritual Rangers";
-            case 84: return "Spiritual Warriors";
-            case 85: return "Spiritual Mages";
-            case 86: return "Skeletal Wyverns";
-            default: return id > 0 ? ("Task #" + id) : "None";
-        }
-    }
-
-    // -------------------------------------------------------------
-    // Chat & Dialogue Scraper
-    // -------------------------------------------------------------
-    private static Object getWidget(Object client, int groupId, int childId) {
+    private static Object getItemContainer(Object client, int containerId) {
         if (client == null) return null;
         try {
-            Method m = client.getClass().getMethod("getWidget", int.class, int.class);
-            m.setAccessible(true);
-            Object w = m.invoke(client, groupId, childId);
-            if (w != null) return w;
+            Object container = invokeMethodQuietly(client, "getItemContainer", containerId);
+            if (container != null) return container;
         } catch (Throwable ignored) {}
-        try {
-            Method m = client.getClass().getMethod("getWidget", int.class);
-            m.setAccessible(true);
-            int packed = (groupId << 16) | childId;
-            return m.invoke(client, packed);
-        } catch (Throwable ignored) {}
-        return null;
-    }
 
-    private static String getWidgetText(Object widget) {
-        if (widget == null) return null;
         try {
-            Method m = widget.getClass().getMethod("getText");
-            m.setAccessible(true);
-            Object res = m.invoke(widget);
-            if (res instanceof String) {
-                String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                if (!s.isEmpty()) return s;
+            Class<?> invEnum = Class.forName("net.runelite.api.InventoryID", true, client.getClass().getClassLoader());
+            if (invEnum != null && invEnum.isEnum()) {
+                for (Object constant : invEnum.getEnumConstants()) {
+                    Object idObj = invokeMethodQuietly(constant, "getId");
+                    if (idObj instanceof Integer && ((Integer) idObj) == containerId) {
+                        Method m = findMethod(client.getClass(), "getItemContainer", invEnum);
+                        if (m != null) {
+                            Object container = m.invoke(client, constant);
+                            if (container != null) return container;
+                        }
+                    }
+                }
             }
         } catch (Throwable ignored) {}
+
+        try {
+            Object containersTable = invokeMethodQuietly(client, "getItemContainers");
+            if (containersTable != null) {
+                Object container = invokeMethodQuietly(containersTable, "get", (long) containerId);
+                if (container != null) return container;
+                container = invokeMethodQuietly(containersTable, "get", containerId);
+                if (container != null) return container;
+            }
+        } catch (Throwable ignored) {}
+
         return null;
     }
 
-    private static Object[] getWidgetChildren(Object widget) {
-        if (widget == null) return null;
-        String[] childMethods = {"getDynamicChildren", "getChildren", "getNestedChildren"};
-        for (String mName : childMethods) {
+    private static void readItemContainer(Object client, int containerId, String prefix, int maxSlots, StringBuilder data) {
+        if (client == null) return;
+        try {
+            Object container = getItemContainer(client, containerId);
+            if (container == null) return;
+
+            Object itemsObj = invokeMethodQuietly(container, "getItems");
+            if (!(itemsObj instanceof Object[])) return;
+
+            Object[] items = (Object[]) itemsObj;
+            for (int i = 0; i < maxSlots; i++) {
+                Object item = (i < items.length) ? items[i] : null;
+                if (item == null) {
+                    data.append(prefix).append("[").append(i).append("]: EMPTY\n");
+                    continue;
+                }
+
+                int id = -1;
+                int qty = 0;
+                Object idObj = invokeMethodQuietly(item, "getId");
+                if (idObj instanceof Integer) id = (Integer) idObj;
+                Object qtyObj = invokeMethodQuietly(item, "getQuantity");
+                if (qtyObj instanceof Integer) qty = (Integer) qtyObj;
+
+                if (id > 0 && id != 65535) {
+                    String name = resolveItemName(id);
+                    data.append(prefix).append("[").append(i).append("]: ")
+                        .append(id).append(",").append(name).append(",").append(Math.max(1, qty)).append("\n");
+                } else {
+                    data.append(prefix).append("[").append(i).append("]: EMPTY\n");
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void processBankAndShop(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            // 1. Bank Container (95) & Bank Widgets (12 = Bank, 192 = Deposit Box, 631 = Seed Vault)
+            Object bankContainer = getItemContainer(client, 95);
+            boolean bankWidgetOpen = false;
             try {
-                Method m = widget.getClass().getMethod(mName);
-                m.setAccessible(true);
-                Object res = m.invoke(widget);
-                if (res instanceof Object[]) {
-                    return (Object[]) res;
+                Object bw = getWidget(client, 12, 1);
+                if (bw == null) bw = getWidget(client, 12, 0);
+                if (bw == null) bw = getWidget(client, 192, 1);
+                if (bw == null) bw = getWidget(client, 631, 1);
+                if (bw != null) {
+                    Object isHidden = invokeMethodQuietly(bw, "isHidden");
+                    if (isHidden instanceof Boolean) {
+                        bankWidgetOpen = !((Boolean) isHidden);
+                    } else {
+                        bankWidgetOpen = true;
+                    }
                 }
             } catch (Throwable ignored) {}
-        }
-        return null;
-    }
 
-    private static void processRuneLiteDialog(Object client, StringBuilder data) {
-        if (client == null) return;
-        try {
-            boolean active = false;
-            String type = "None";
-            String title = "";
-            String text = "";
-            List<String> options = new ArrayList<>();
-
-            // 1. NPC Dialogue (Group 231)
-            Object npcTextWidget = getWidget(client, 231, 6);
-            if (npcTextWidget == null) npcTextWidget = getWidget(client, 231, 4);
-            Object npcNameWidget = getWidget(client, 231, 4);
-            if (npcNameWidget == null || npcNameWidget == npcTextWidget) npcNameWidget = getWidget(client, 231, 2);
-
-            String npcText = getWidgetText(npcTextWidget);
-            if (npcText != null && !npcText.isEmpty()) {
-                active = true;
-                type = "NPC";
-                text = npcText;
-                String name = getWidgetText(npcNameWidget);
-                title = (name != null && !name.isEmpty()) ? name : "NPC";
-            }
-
-            // 2. Player Dialogue (Group 217)
-            if (!active) {
-                Object pTextWidget = getWidget(client, 217, 6);
-                if (pTextWidget == null) pTextWidget = getWidget(client, 217, 4);
-                Object pNameWidget = getWidget(client, 217, 2);
-                if (pNameWidget == null) pNameWidget = getWidget(client, 217, 3);
-
-                String pText = getWidgetText(pTextWidget);
-                if (pText != null && !pText.isEmpty()) {
-                    active = true;
-                    type = "Player";
-                    text = pText;
-                    String name = getWidgetText(pNameWidget);
-                    title = (name != null && !name.isEmpty()) ? name : "Player";
-                }
-            }
-
-            // 3. Options Dialogue (Group 219)
-            if (!active) {
-                Object optWidget = getWidget(client, 219, 1);
-                if (optWidget != null) {
-                    Object[] children = getWidgetChildren(optWidget);
-                    if (children != null && children.length > 0) {
-                        for (int i = 0; i < children.length; i++) {
-                            String opt = getWidgetText(children[i]);
-                            if (opt != null && !opt.isEmpty()) {
-                                if (i == 0 && (opt.toLowerCase().contains("select") || opt.toLowerCase().contains("option") || opt.toLowerCase().contains("choose"))) {
-                                    title = opt;
-                                } else {
-                                    options.add(opt);
-                                }
-                            }
-                        }
-                        if (!options.isEmpty() || !title.isEmpty()) {
-                            active = true;
-                            type = "Options";
-                            if (title.isEmpty()) title = "Select an Option";
-                            text = String.join(" | ", options);
-                        }
-                    }
-                }
-            }
-
-            // 4. Message Dialogue (Group 193 / Group 229 / Group 11 / Group 633)
-            if (!active) {
-                int[][] msgWidgets = {{193, 2}, {193, 1}, {229, 1}, {229, 2}, {11, 2}, {11, 1}, {633, 1}};
-                for (int[] mw : msgWidgets) {
-                    Object w = getWidget(client, mw[0], mw[1]);
-                    String msgText = getWidgetText(w);
-                    if (msgText != null && !msgText.isEmpty() && msgText.length() > 2) {
-                        active = true;
-                        type = "Message";
-                        title = "Game Message";
-                        text = msgText;
-                        break;
-                    }
-                }
-            }
-
-            data.append("DIALOG_ACTIVE: ").append(active ? "True" : "False").append("\n");
-            if (active) {
-                data.append("DIALOG_TYPE: ").append(type).append("\n");
-                data.append("DIALOG_TITLE: ").append(title).append("\n");
-                data.append("DIALOG_TEXT: ").append(text.replace('\n', ' ')).append("\n");
-                if (!options.isEmpty()) {
-                    StringBuilder optSb = new StringBuilder();
-                    for (int i = 0; i < options.size(); i++) {
-                        if (i > 0) optSb.append("|");
-                        optSb.append(options.get(i));
-                    }
-                    data.append("DIALOG_OPTIONS: ").append(optSb.toString()).append("\n");
-                }
-            }
-        } catch (Throwable ignored) {}
-    }
-
-    // -------------------------------------------------------------
-    // Bank and Shop Container Scraper
-    // -------------------------------------------------------------
-    private static void processRuneLiteBankAndShop(Object client, StringBuilder data) {
-        if (client == null) return;
-        try {
-            // 1. Bank (Container 95)
-            boolean bankOpen = false;
-            int bankItemsCount = 0;
-            Object bankWidget = getWidget(client, 12, 13);
-            if (bankWidget == null) bankWidget = getWidget(client, 12, 1);
-            if (bankWidget != null) bankOpen = true;
-
-            int maxBankItems = 100;
-            int[] bankIds = new int[maxBankItems];
-            int[] bankQtys = new int[maxBankItems];
-            String[] bankNames = new String[maxBankItems];
-            for (int i = 0; i < maxBankItems; i++) bankIds[i] = -1;
-
-            readContainerRaw(client, 95, bankIds, bankQtys, bankNames, maxBankItems);
-            for (int i = 0; i < maxBankItems; i++) {
-                if (bankIds[i] > 0 && bankIds[i] != 65535) {
-                    bankOpen = true;
-                    bankItemsCount++;
-                    String name = bankNames[i] != null ? bankNames[i] : resolveItemName(client, bankIds[i]);
-                    if (name == null || name.isEmpty()) name = "Item #" + bankIds[i];
-                    data.append("BANK_ITEM[").append(i).append("]: ").append(bankIds[i]).append(",").append(name).append(",").append(bankQtys[i]).append("\n");
-                }
-            }
-            data.append("BANK_OPEN: ").append(bankOpen ? "True" : "False").append("\n");
-            data.append("BANK_TOTAL_ITEMS: ").append(bankItemsCount).append("\n");
-
-            // 2. Shop / General Store (Container 511)
-            boolean shopOpen = false;
-            int shopItemsCount = 0;
-            String shopName = "General Store";
-            Object shopWidget = getWidget(client, 300, 1);
-            if (shopWidget != null) {
-                shopOpen = true;
-                Object shopTitleWidget = getWidget(client, 300, 2);
-                String title = getWidgetText(shopTitleWidget);
-                if (title != null && !title.isEmpty()) shopName = title;
-            }
-
-            int maxShopItems = 50;
-            int[] shopIds = new int[maxShopItems];
-            int[] shopQtys = new int[maxShopItems];
-            String[] shopNames = new String[maxShopItems];
-            for (int i = 0; i < maxShopItems; i++) shopIds[i] = -1;
-
-            readContainerRaw(client, 511, shopIds, shopQtys, shopNames, maxShopItems);
-            for (int i = 0; i < maxShopItems; i++) {
-                if (shopIds[i] > 0 && shopIds[i] != 65535) {
-                    shopOpen = true;
-                    shopItemsCount++;
-                    String name = shopNames[i] != null ? shopNames[i] : resolveItemName(client, shopIds[i]);
-                    if (name == null || name.isEmpty()) name = "Item #" + shopIds[i];
-                    data.append("SHOP_ITEM[").append(i).append("]: ").append(shopIds[i]).append(",").append(name).append(",").append(shopQtys[i]).append("\n");
-                }
-            }
-            data.append("SHOP_OPEN: ").append(shopOpen ? "True" : "False").append("\n");
-            if (shopOpen) {
-                data.append("SHOP_NAME: ").append(shopName).append("\n");
-            }
-            data.append("SHOP_TOTAL_ITEMS: ").append(shopItemsCount).append("\n");
-        } catch (Throwable ignored) {}
-    }
-
-    private static void readContainerRaw(Object client, int containerId, int[] itemIds, int[] itemQtys, String[] itemNames, int maxItems) {
-        try {
-            Object container = null;
-            for (Method m : client.getClass().getMethods()) {
-                if (m.getName().equals("getItemContainer") && m.getParameterCount() == 1) {
-                    Class<?> pType = m.getParameterTypes()[0];
-                    if (pType == int.class || pType == Integer.class) {
-                        try {
-                            m.setAccessible(true);
-                            container = m.invoke(client, containerId);
-                            if (container != null) break;
-                        } catch (Throwable ignored) {}
-                    } else if (pType.isEnum()) {
-                        for (Object enumConst : pType.getEnumConstants()) {
-                            try {
-                                String eName = ((Enum<?>) enumConst).name();
-                                boolean match = false;
-                                if (containerId == 93 && (eName.equalsIgnoreCase("INVENTORY") || eName.contains("INV"))) match = true;
-                                if (containerId == 94 && (eName.equalsIgnoreCase("EQUIPMENT") || eName.contains("EQUIP"))) match = true;
-                                if (containerId == 95 && (eName.equalsIgnoreCase("BANK") || eName.contains("BANK"))) match = true;
-                                if (containerId == 511 && (eName.equalsIgnoreCase("SHOP") || eName.contains("SHOP"))) match = true;
-                                if (!match) {
-                                    try {
-                                        Method getId = pType.getMethod("getId");
-                                        getId.setAccessible(true);
-                                        int id = (Integer) getId.invoke(enumConst);
-                                        if (id == containerId) match = true;
-                                    } catch (Throwable ignored) {}
-                                }
-                                if (match) {
-                                    m.setAccessible(true);
-                                    container = m.invoke(client, enumConst);
-                                    if (container != null) break;
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                        if (container != null) break;
-                    }
-                }
-            }
-
-            if (container != null) {
-                Object itemsObj = null;
-                try {
-                    Method getItems = container.getClass().getMethod("getItems");
-                    getItems.setAccessible(true);
-                    itemsObj = getItems.invoke(container);
-                } catch (Throwable ignored) {}
-
+            if (bankContainer != null) {
+                Object itemsObj = invokeMethodQuietly(bankContainer, "getItems");
                 if (itemsObj instanceof Object[]) {
                     Object[] items = (Object[]) itemsObj;
-                    for (int i = 0; i < maxItems && i < items.length; i++) {
-                        if (items[i] != null) {
-                            Object itm = items[i];
-                            int id = -1;
-                            int qty = 0;
-                            try {
-                                Method getId = itm.getClass().getMethod("getId");
-                                getId.setAccessible(true);
-                                id = (Integer) getId.invoke(itm);
-                            } catch (Throwable ignored) {}
-                            try {
-                                Method getQty = itm.getClass().getMethod("getQuantity");
-                                getQty.setAccessible(true);
-                                qty = (Integer) getQty.invoke(itm);
-                            } catch (Throwable ignored) {}
+                    int count = 0;
+                    for (int i = 0; i < items.length; i++) {
+                        Object it = items[i];
+                        if (it == null) continue;
+                        int id = -1, qty = 0;
+                        Object idObj = invokeMethodQuietly(it, "getId");
+                        if (idObj instanceof Integer) id = (Integer) idObj;
+                        Object qtyObj = invokeMethodQuietly(it, "getQuantity");
+                        if (qtyObj instanceof Integer) qty = (Integer) qtyObj;
 
-                            if (id > 0 && id != 65535) {
-                                itemIds[i] = id;
-                                itemQtys[i] = Math.max(1, qty);
-                            }
+                        if (id > 0 && id != 65535) {
+                            String name = resolveItemName(id);
+                            data.append("BANK_ITEM[").append(count).append("]: ").append(id).append(",").append(name).append(",").append(Math.max(1, qty)).append("\n");
+                            count++;
                         }
                     }
+                    data.append("BANK_OPEN: True\n");
+                    data.append("IS_BANK_OPEN: True\n");
+                    data.append("BANK_TOTAL_ITEMS: ").append(count).append("\n");
+                } else {
+                    data.append("BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
+                    data.append("IS_BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
+                    data.append("BANK_TOTAL_ITEMS: 0\n");
+                }
+            } else {
+                data.append("BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
+                data.append("IS_BANK_OPEN: ").append(bankWidgetOpen ? "True" : "False").append("\n");
+                data.append("BANK_TOTAL_ITEMS: 0\n");
+            }
+
+            // 2. Shop Container (3) & Shop Widgets (300 = Shop, 300, 16)
+            Object shopContainer = getItemContainer(client, 3);
+            boolean shopWidgetOpen = false;
+            try {
+                Object sw = getWidget(client, 300, 1);
+                if (sw == null) sw = getWidget(client, 300, 0);
+                if (sw != null) {
+                    Object isHidden = invokeMethodQuietly(sw, "isHidden");
+                    if (isHidden instanceof Boolean) {
+                        shopWidgetOpen = !((Boolean) isHidden);
+                    } else {
+                        shopWidgetOpen = true;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            if (shopContainer != null) {
+                Object itemsObj = invokeMethodQuietly(shopContainer, "getItems");
+                if (itemsObj instanceof Object[]) {
+                    Object[] items = (Object[]) itemsObj;
+                    int count = 0;
+                    for (int i = 0; i < items.length; i++) {
+                        Object it = items[i];
+                        if (it == null) continue;
+                        int id = -1, qty = 0;
+                        Object idObj = invokeMethodQuietly(it, "getId");
+                        if (idObj instanceof Integer) id = (Integer) idObj;
+                        Object qtyObj = invokeMethodQuietly(it, "getQuantity");
+                        if (qtyObj instanceof Integer) qty = (Integer) qtyObj;
+
+                        if (id > 0 && id != 65535) {
+                            String name = resolveItemName(id);
+                            data.append("SHOP_ITEM[").append(count).append("]: ").append(id).append(",").append(name).append(",").append(Math.max(1, qty)).append("\n");
+                            count++;
+                        }
+                    }
+                    data.append("SHOP_OPEN: True\n");
+                    data.append("IS_SHOP_OPEN: True\n");
+                    data.append("SHOP_TOTAL_ITEMS: ").append(count).append("\n");
+                } else {
+                    data.append("SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
+                    data.append("IS_SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
+                    data.append("SHOP_TOTAL_ITEMS: 0\n");
+                }
+            } else {
+                data.append("SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
+                data.append("IS_SHOP_OPEN: ").append(shopWidgetOpen ? "True" : "False").append("\n");
+                data.append("SHOP_TOTAL_ITEMS: 0\n");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static final String[] RUNE_POUCH_RUNES = {
+        "None", "Air rune", "Water rune", "Earth rune", "Fire rune", "Mind rune",
+        "Chaos rune", "Death rune", "Blood rune", "Cosmic rune", "Nature rune",
+        "Law rune", "Body rune", "Soul rune", "Astral rune", "Mist rune",
+        "Mud rune", "Dust rune", "Lava rune", "Steam rune", "Smoke rune", "Wrath rune", "Sunfire rune"
+    };
+
+    private static void processGrandExchange(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            Object offersObj = invokeMethodQuietly(client, "getGrandExchangeOffers");
+            if (offersObj instanceof Object[]) {
+                Object[] offers = (Object[]) offersObj;
+                for (int i = 0; i < offers.length && i < 8; i++) {
+                    Object offer = offers[i];
+                    if (offer == null) {
+                        data.append("GE_SLOT[").append(i).append("]: Empty,0,Empty,0,0,0,0\n");
+                        continue;
+                    }
+                    Object stateObj = invokeMethodQuietly(offer, "getState");
+                    String state = (stateObj != null) ? stateObj.toString() : "Empty";
+                    int itemId = 0, price = 0, totalQty = 0, qtySold = 0, spent = 0;
+                    Object idObj = invokeMethodQuietly(offer, "getItemId");
+                    if (idObj instanceof Integer) itemId = (Integer) idObj;
+                    Object prObj = invokeMethodQuietly(offer, "getPrice");
+                    if (prObj instanceof Integer) price = (Integer) prObj;
+                    Object tqObj = invokeMethodQuietly(offer, "getTotalQuantity");
+                    if (tqObj instanceof Integer) totalQty = (Integer) tqObj;
+                    Object qsObj = invokeMethodQuietly(offer, "getQuantitySold");
+                    if (qsObj instanceof Integer) qtySold = (Integer) qsObj;
+                    Object spObj = invokeMethodQuietly(offer, "getSpent");
+                    if (spObj instanceof Integer) spent = (Integer) spObj;
+
+                    String itemName = (itemId > 0) ? resolveItemName(itemId) : "None";
+                    data.append("GE_SLOT[").append(i).append("]: ")
+                        .append(state).append(",")
+                        .append(itemId).append(",")
+                        .append(itemName).append(",")
+                        .append(price).append(",")
+                        .append(totalQty).append(",")
+                        .append(qtySold).append(",")
+                        .append(spent).append("\n");
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    // -------------------------------------------------------------
-    // Scene & Tile Objects (Trees, Banks, General Stores, Altars, Shortcuts, Agility, Ground Items)
-    // -------------------------------------------------------------
-    private static void processRuneLiteSceneObjects(Object client, int playerX, int playerY, int plane, StringBuilder data) {
-        if (client == null || playerX <= 0 || playerY <= 0) return;
+    private static void processStorageContainers(Object client, StringBuilder data) {
+        if (client == null) return;
         try {
-            Object scene = null;
-            try {
-                Method getTopView = client.getClass().getMethod("getTopLevelWorldView");
-                getTopView.setAccessible(true);
-                Object topView = getTopView.invoke(client);
-                if (topView != null) {
-                    Method getScene = topView.getClass().getMethod("getScene");
-                    getScene.setAccessible(true);
-                    scene = getScene.invoke(topView);
+            // 1. Rune Pouch (Varbits 1144, 1145, 1146, 14285 / amounts 1139, 1140, 1141, 14286)
+            int[] runeTypes = {
+                getVarbitValue(client, 1144),
+                getVarbitValue(client, 1145),
+                getVarbitValue(client, 1146),
+                getVarbitValue(client, 14285)
+            };
+            int[] runeAmounts = {
+                getVarbitValue(client, 1139),
+                getVarbitValue(client, 1140),
+                getVarbitValue(client, 1141),
+                getVarbitValue(client, 14286)
+            };
+            for (int i = 0; i < 4; i++) {
+                int typeIdx = runeTypes[i];
+                int qty = runeAmounts[i];
+                String runeName = (typeIdx > 0 && typeIdx < RUNE_POUCH_RUNES.length) ? RUNE_POUCH_RUNES[typeIdx] : (typeIdx > 0 ? "Rune #" + typeIdx : "None");
+                if (typeIdx > 0 && qty > 0) {
+                    data.append("RUNE_POUCH[").append(i).append("]: ").append(typeIdx).append(",").append(runeName).append(",").append(qty).append("\n");
+                } else {
+                    data.append("RUNE_POUCH[").append(i).append("]: 0,None,0\n");
                 }
-            } catch (Throwable ignored) {}
-            if (scene == null) {
-                Method getScene = client.getClass().getMethod("getScene");
-                getScene.setAccessible(true);
-                scene = getScene.invoke(client);
             }
+
+            // 2. Gem Bag (Varbits 3886..3890)
+            int sapphire = getVarbitValue(client, 3886);
+            int emerald = getVarbitValue(client, 3887);
+            int ruby = getVarbitValue(client, 3888);
+            int diamond = getVarbitValue(client, 3889);
+            int dragonstone = getVarbitValue(client, 3890);
+            if (sapphire >= 0 || emerald >= 0 || ruby >= 0 || diamond >= 0 || dragonstone >= 0) {
+                data.append("GEM_BAG: ")
+                    .append(Math.max(0, sapphire)).append(",")
+                    .append(Math.max(0, emerald)).append(",")
+                    .append(Math.max(0, ruby)).append(",")
+                    .append(Math.max(0, diamond)).append(",")
+                    .append(Math.max(0, dragonstone)).append("\n");
+            }
+
+            // 3. Essence Pouches (Small, Medium, Large, Giant, Colossal)
+            int smallEss = getVarpValue(client, 1374);
+            int medEss = getVarpValue(client, 1375);
+            int largeEss = getVarpValue(client, 1376);
+            int giantEss = getVarpValue(client, 1377);
+            int colossalEss = getVarbitValue(client, 13709);
+            if (smallEss >= 0 || medEss >= 0 || largeEss >= 0 || giantEss >= 0 || colossalEss >= 0) {
+                data.append("ESSENCE_POUCHES: ")
+                    .append(Math.max(0, smallEss)).append(",")
+                    .append(Math.max(0, medEss)).append(",")
+                    .append(Math.max(0, largeEss)).append(",")
+                    .append(Math.max(0, giantEss)).append(",")
+                    .append(Math.max(0, colossalEss)).append("\n");
+            }
+
+            // 4. Looting Bag Container (516)
+            readItemContainer(client, 516, "LOOTING_BAG", 28, data);
+        } catch (Throwable ignored) {}
+    }
+
+    private static void processSceneObjectsAndGroundItems(Object client, int playerX, int playerY, int plane, StringBuilder data) {
+        if (client == null || playerX <= 0 || playerY <= 0) return;
+        long now = System.currentTimeMillis();
+        if ((now - lastSceneScanTime < 150) && (playerX == lastScenePlayerX) && (playerY == lastScenePlayerY) && (plane == lastScenePlane) && cachedSceneData.length() > 0) {
+            data.append(cachedSceneData);
+            return;
+        }
+
+        try {
+            cachedSceneData.setLength(0);
+            Object scene = null;
+            Object topView = invokeMethodQuietly(client, "getTopLevelWorldView");
+            if (topView != null) scene = invokeMethodQuietly(topView, "getScene");
+            if (scene == null) scene = invokeMethodQuietly(client, "getScene");
             if (scene == null) return;
 
-            Method getTilesMethod = scene.getClass().getMethod("getTiles");
-            getTilesMethod.setAccessible(true);
-            Object tilesObj = getTilesMethod.invoke(scene);
+            Object tilesObj = invokeMethodQuietly(scene, "getTiles");
             if (!(tilesObj instanceof Object[][][])) return;
 
             Object[][][] tiles = (Object[][][]) tilesObj;
@@ -2858,39 +881,56 @@ public class BytecodeAgent {
             if (planeTiles == null) return;
 
             int baseX = 0, baseY = 0;
-            try {
-                Method getBaseX = client.getClass().getMethod("getBaseX");
-                Method getBaseY = client.getClass().getMethod("getBaseY");
-                getBaseX.setAccessible(true);
-                getBaseY.setAccessible(true);
-                baseX = (Integer) getBaseX.invoke(client);
-                baseY = (Integer) getBaseY.invoke(client);
-            } catch (Throwable ignored) {}
-
-            int localX = playerX - baseX;
-            int localY = playerY - baseY;
-            if (localX < 0 || localX >= 104 || localY < 0 || localY >= 104) {
-                localX = 52; localY = 52;
+            if (topView != null) {
+                Object bx = invokeMethodQuietly(topView, "getBaseX");
+                Object by = invokeMethodQuietly(topView, "getBaseY");
+                if (bx instanceof Integer && by instanceof Integer) {
+                    baseX = (Integer) bx;
+                    baseY = (Integer) by;
+                }
+            }
+            if (baseX == 0 || baseY == 0) {
+                Object bx = invokeMethodQuietly(client, "getBaseX");
+                Object by = invokeMethodQuietly(client, "getBaseY");
+                if (bx instanceof Integer && by instanceof Integer) {
+                    baseX = (Integer) bx;
+                    baseY = (Integer) by;
+                }
+            }
+            if (baseX == 0 || baseY == 0) {
+                Object lp = invokeMethodQuietly(client, "getLocalPlayer");
+                if (lp != null) {
+                    Object loc = invokeMethodQuietly(lp, "getLocalLocation");
+                    if (loc != null) {
+                        Object sx = invokeMethodQuietly(loc, "getSceneX");
+                        Object sy = invokeMethodQuietly(loc, "getSceneY");
+                        if (sx instanceof Integer && sy instanceof Integer) {
+                            baseX = playerX - (Integer) sx;
+                            baseY = playerY - (Integer) sy;
+                        }
+                    }
+                }
             }
 
-            int treeCount = 0;
-            int bankCount = 0;
-            int shopCount = 0;
-            int altarCount = 0;
-            int rockCount = 0;
-            int shortcutCount = 0;
-            int obstacleCount = 0;
-            int groundItemCount = 0;
-            int marksOfGraceCount = 0;
+            int localX = (baseX > 0) ? playerX - baseX : 52;
+            int localY = (baseY > 0) ? playerY - baseY : 52;
+            int minTx = Math.max(0, localX - 45);
+            int maxTx = Math.min(103, localX + 45);
+            int minTy = Math.max(0, localY - 45);
+            int maxTy = Math.min(103, localY + 45);
 
-            int radius = 16;
-            int minX = Math.max(0, localX - radius);
-            int maxX = Math.min(103, localX + radius);
-            int minY = Math.max(0, localY - radius);
-            int maxY = Math.min(103, localY + radius);
+            treeEntries.clear();
+            bankEntries.clear();
+            shopEntries.clear();
+            altarEntries.clear();
+            rockEntries.clear();
+            shortcutEntries.clear();
+            obstacleEntries.clear();
+            groundItemEntries.clear();
 
-            for (int tx = minX; tx <= maxX; tx++) {
-                for (int ty = minY; ty <= maxY; ty++) {
+            for (int tx = minTx; tx <= maxTx; tx++) {
+                for (int ty = minTy; ty <= maxTy; ty++) {
+                    if (tx >= planeTiles.length || ty >= planeTiles[tx].length) continue;
                     Object tile = planeTiles[tx][ty];
                     if (tile == null) continue;
 
@@ -2898,567 +938,1111 @@ public class BytecodeAgent {
                     int worldY = baseY + ty;
                     int dist = Math.max(Math.abs(worldX - playerX), Math.abs(worldY - playerY));
 
-                    // 1. GameObjects
-                    try {
-                        Method getGameObjects = tile.getClass().getMethod("getGameObjects");
-                        getGameObjects.setAccessible(true);
-                        Object[] gObjs = (Object[]) getGameObjects.invoke(tile);
-                        if (gObjs != null) {
-                            for (Object go : gObjs) {
-                                if (go != null) {
-                                    int objId = getObjectId(go);
-                                    if (objId > 0) {
-                                        String name = extractObjectName(client, go, objId);
-                                        String cat = classifyObject(name, objId);
-                                        if ("Tree".equals(cat) && treeCount < 30) {
-                                            String status = isStump(name, objId) ? "Stump" : "Available";
-                                            data.append("TREE[").append(treeCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                                .append(worldX).append(",").append(worldY).append(",").append(status).append("\n");
-                                            treeCount++;
-                                        } else if ("Bank".equals(cat) && bankCount < 15) {
-                                            data.append("BANK_OBJ[").append(bankCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                                .append(worldX).append(",").append(worldY).append("\n");
-                                            bankCount++;
-                                        } else if ("Shop".equals(cat) && shopCount < 15) {
-                                            data.append("SHOP_OBJ[").append(shopCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                                .append(worldX).append(",").append(worldY).append("\n");
-                                            shopCount++;
-                                        } else if ("Altar".equals(cat) && altarCount < 15) {
-                                            data.append("ALTAR_OBJ[").append(altarCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                                .append(worldX).append(",").append(worldY).append("\n");
-                                            altarCount++;
-                                        } else if ("Rock".equals(cat) && rockCount < 20) {
-                                            data.append("ROCK_OBJ[").append(rockCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                                .append(worldX).append(",").append(worldY).append("\n");
-                                            rockCount++;
-                                        }
+                    // 1. Game Objects
+                    Object gObjsObj = invokeMethodQuietly(tile, "getGameObjects");
+                    if (gObjsObj instanceof Object[]) {
+                        for (Object go : (Object[]) gObjsObj) {
+                            if (go != null) scanSceneObject(client, go, dist, worldX, worldY, playerX, playerY);
+                        }
+                    }
 
-                                        if (isAgilityShortcut(name, objId) && shortcutCount < 20) {
-                                            String req = getShortcutReqLevel(name, objId, worldX, worldY);
-                                            data.append("SHORTCUT[").append(shortcutCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(req).append(",")
-                                                .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                            shortcutCount++;
-                                        }
+                    // 2. Wall Objects
+                    Object wall = invokeMethodQuietly(tile, "getWallObject");
+                    if (wall != null) scanSceneObject(client, wall, dist, worldX, worldY, playerX, playerY);
 
-                                        if (isAgilityObstacle(name, objId) && obstacleCount < 25) {
-                                            String course = detectAgilityCourse(playerX, playerY);
-                                            data.append("AGILITY_OBSTACLE[").append(obstacleCount).append("]: ")
-                                                .append(objId).append(",").append(name).append(",").append(course).append(",")
-                                                .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                            obstacleCount++;
-                                        }
-                                    }
-                                }
+                    // 3. Ground Objects
+                    Object groundObj = invokeMethodQuietly(tile, "getGroundObject");
+                    if (groundObj != null) scanSceneObject(client, groundObj, dist, worldX, worldY, playerX, playerY);
+
+                    // 4. Decorative Objects
+                    Object decObj = invokeMethodQuietly(tile, "getDecorativeObject");
+                    if (decObj != null) scanSceneObject(client, decObj, dist, worldX, worldY, playerX, playerY);
+
+                    // 5. Ground Items
+                    Object gItemsObj = invokeMethodQuietly(tile, "getGroundItems");
+                    if (gItemsObj instanceof Iterable) {
+                        for (Object gi : (Iterable<?>) gItemsObj) {
+                            if (gi == null) continue;
+                            int gItemId = -1, gQty = 1;
+                            Object idObj = invokeMethodQuietly(gi, "getId");
+                            if (idObj instanceof Integer) gItemId = (Integer) idObj;
+                            Object qtyObj = invokeMethodQuietly(gi, "getQuantity");
+                            if (qtyObj instanceof Integer) gQty = (Integer) qtyObj;
+
+                            if (gItemId > 0 && gItemId != 65535) {
+                                String gName = resolveItemName(gItemId);
+                                groundItemEntries.add(new SceneEntry(dist, gItemId, gName, worldX, worldY, String.valueOf(Math.max(1, gQty))));
                             }
                         }
-                    } catch (Throwable ignored) {}
-
-                    // 2. WallObject
-                    try {
-                        Method getWall = tile.getClass().getMethod("getWallObject");
-                        getWall.setAccessible(true);
-                        Object wall = getWall.invoke(tile);
-                        if (wall != null) {
-                            int objId = getObjectId(wall);
-                            if (objId > 0) {
-                                String name = extractObjectName(client, wall, objId);
-                                String cat = classifyObject(name, objId);
-                                if ("Bank".equals(cat) && bankCount < 15) {
-                                    data.append("BANK_OBJ[").append(bankCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                        .append(worldX).append(",").append(worldY).append("\n");
-                                    bankCount++;
-                                } else if ("Shop".equals(cat) && shopCount < 15) {
-                                    data.append("SHOP_OBJ[").append(shopCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(dist).append(",")
-                                        .append(worldX).append(",").append(worldY).append("\n");
-                                    shopCount++;
-                                }
-
-                                if (isAgilityShortcut(name, objId) && shortcutCount < 20) {
-                                    String req = getShortcutReqLevel(name, objId, worldX, worldY);
-                                    data.append("SHORTCUT[").append(shortcutCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(req).append(",")
-                                        .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                    shortcutCount++;
-                                }
-
-                                if (isAgilityObstacle(name, objId) && obstacleCount < 25) {
-                                    String course = detectAgilityCourse(playerX, playerY);
-                                    data.append("AGILITY_OBSTACLE[").append(obstacleCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(course).append(",")
-                                        .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                    obstacleCount++;
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-
-                    // 3. GroundObject
-                    try {
-                        Method getGroundObj = tile.getClass().getMethod("getGroundObject");
-                        getGroundObj.setAccessible(true);
-                        Object groundObj = getGroundObj.invoke(tile);
-                        if (groundObj != null) {
-                            int objId = getObjectId(groundObj);
-                            if (objId > 0) {
-                                String name = extractObjectName(client, groundObj, objId);
-                                if (isAgilityShortcut(name, objId) && shortcutCount < 20) {
-                                    String req = getShortcutReqLevel(name, objId, worldX, worldY);
-                                    data.append("SHORTCUT[").append(shortcutCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(req).append(",")
-                                        .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                    shortcutCount++;
-                                }
-                                if (isAgilityObstacle(name, objId) && obstacleCount < 25) {
-                                    String course = detectAgilityCourse(playerX, playerY);
-                                    data.append("AGILITY_OBSTACLE[").append(obstacleCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(course).append(",")
-                                        .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                    obstacleCount++;
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-
-                    // 4. DecorativeObject
-                    try {
-                        Method getDecObj = tile.getClass().getMethod("getDecorativeObject");
-                        getDecObj.setAccessible(true);
-                        Object decObj = getDecObj.invoke(tile);
-                        if (decObj != null) {
-                            int objId = getObjectId(decObj);
-                            if (objId > 0) {
-                                String name = extractObjectName(client, decObj, objId);
-                                if (isAgilityShortcut(name, objId) && shortcutCount < 20) {
-                                    String req = getShortcutReqLevel(name, objId, worldX, worldY);
-                                    data.append("SHORTCUT[").append(shortcutCount).append("]: ")
-                                        .append(objId).append(",").append(name).append(",").append(req).append(",")
-                                        .append(dist).append(",").append(worldX).append(",").append(worldY).append("\n");
-                                    shortcutCount++;
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-
-                    // 5. GroundItems
-                    try {
-                        Method getGroundItems = tile.getClass().getMethod("getGroundItems");
-                        getGroundItems.setAccessible(true);
-                        Object gItemsObj = getGroundItems.invoke(tile);
-                        if (gItemsObj instanceof Iterable && groundItemCount < 30) {
-                            for (Object gi : (Iterable<?>) gItemsObj) {
-                                if (gi != null) {
-                                    int gItemId = -1;
-                                    int gQty = 1;
-                                    try {
-                                        Method getId = gi.getClass().getMethod("getId");
-                                        getId.setAccessible(true);
-                                        gItemId = (Integer) getId.invoke(gi);
-                                    } catch (Throwable ignored) {}
-                                    try {
-                                        Method getQty = gi.getClass().getMethod("getQuantity");
-                                        getQty.setAccessible(true);
-                                        gQty = (Integer) getQty.invoke(gi);
-                                    } catch (Throwable ignored) {}
-                                    if (gItemId == 11849) {
-                                        marksOfGraceCount += Math.max(1, gQty);
-                                    }
-                                    if (gItemId > 0 && gItemId != 65535 && groundItemCount < 30) {
-                                        String gName = resolveItemName(client, gItemId);
-                                        if (gName == null || gName.isEmpty()) gName = "Item #" + gItemId;
-                                        data.append("GROUND_ITEM[").append(groundItemCount).append("]: ")
-                                            .append(gItemId).append(",")
-                                            .append(gName).append(",")
-                                            .append(gQty).append(",")
-                                            .append(dist).append(",")
-                                            .append(worldX).append(",")
-                                            .append(worldY).append("\n");
-                                        groundItemCount++;
-                                    }
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
+                    }
                 }
             }
 
-            data.append("TOTAL_TREES: ").append(treeCount).append("\n");
-            data.append("TOTAL_BANKS: ").append(bankCount).append("\n");
-            data.append("TOTAL_SHOPS: ").append(shopCount).append("\n");
-            data.append("TOTAL_ALTARS: ").append(altarCount).append("\n");
-            data.append("TOTAL_ROCKS: ").append(rockCount).append("\n");
-            data.append("TOTAL_SHORTCUTS: ").append(shortcutCount).append("\n");
-            data.append("TOTAL_AGILITY_OBSTACLES: ").append(obstacleCount).append("\n");
-            data.append("TOTAL_GROUND_ITEMS: ").append(groundItemCount).append("\n");
-            data.append("MARKS_OF_GRACE_COUNT: ").append(marksOfGraceCount).append("\n");
-
-            String courseName = detectAgilityCourse(playerX, playerY);
-            data.append("AGILITY_COURSE: ").append(courseName).append("\n");
-            data.append("AGILITY_COURSE_LEVEL: ").append(detectAgilityCourseLevel(courseName)).append("\n");
-        } catch (Throwable ignored) {}
-    }
-
-    private static boolean isAgilityShortcut(String name, int id) {
-        if (name == null) return false;
-        String n = name.toLowerCase();
-        if (n.contains("stepping stone") || n.contains("loose railing") || n.contains("underwall tunnel") ||
-            n.contains("crevice") || n.contains("obstacle pipe") || n.contains("log balance") ||
-            n.contains("stile") || n.contains("strange floor") || n.contains("spiked chain") ||
-            n.contains("handholds") || n.contains("monkey bars") || n.contains("crumbling wall") ||
-            n.contains("scale rock") || n.contains("climb rock") || n.contains("squeeze-through") ||
-            n.contains("narrow wall") || n.contains("grapple") || n.contains("shortcut") ||
-            n.contains("climb down rock") || n.contains("climb up rock") || n.contains("climb-over") ||
-            n.contains("jump down") || n.contains("jump-down") || n.contains("rope swing")) {
-            return true;
-        }
-        return false;
-    }
-
-    private static String getShortcutReqLevel(String name, int id, int worldX, int worldY) {
-        if (name == null) return "1";
-        String n = name.toLowerCase();
-        if (n.contains("stile")) return "1";
-        if (n.contains("crumbling wall")) return "5";
-        if (n.contains("underwall tunnel")) {
-            if (worldX >= 3070 && worldX <= 3120 && worldY >= 3240 && worldY <= 3280) return "11";
-            if (worldX >= 2530 && worldX <= 2560 && worldY >= 3080 && worldY <= 3110) return "16";
-            if (worldX >= 3130 && worldX <= 3155 && worldY >= 3500 && worldY <= 3520) return "21";
-            if (worldX >= 3080 && worldX <= 3120 && worldY >= 3490 && worldY <= 3510) return "34";
-            if (worldX >= 2870 && worldX <= 2900 && worldY >= 9800 && worldY <= 9850) return "70";
-            return "15+";
-        }
-        if (n.contains("loose railing")) {
-            if (worldX >= 3260 && worldX <= 3290 && worldY >= 3370 && worldY <= 3410) return "13";
-            return "65";
-        }
-        if (n.contains("stepping stone")) {
-            if (worldX >= 2850 && worldX <= 2880 && worldY >= 2960 && worldY <= 2990) return "12";
-            if (worldX >= 3170 && worldX <= 3200 && worldY >= 3350 && worldY <= 3380) return "31";
-            if (worldX >= 2850 && worldX <= 2880 && worldY >= 2950 && worldY <= 2980) return "74";
-            if (worldX >= 3040 && worldX <= 3080 && worldY >= 3830 && worldY <= 3870) return "82";
-            return "30+";
-        }
-        if (n.contains("log balance")) {
-            if (worldX >= 2590 && worldX <= 2620 && worldY >= 3470 && worldY <= 3500) return "20";
-            if (worldX >= 2600 && worldX <= 2620 && worldY >= 3330 && worldY <= 3350) return "33";
-            return "20+";
-        }
-        if (n.contains("strange floor")) return "80";
-        if (n.contains("spiked chain")) return "61 / 71";
-        if (n.contains("handholds")) return "60";
-        if (n.contains("monkey bars")) return "57";
-        if (n.contains("crevice")) {
-            if (worldX >= 1300 && worldX <= 1350 && worldY >= 3800 && worldY <= 3850) return "42";
-            if (worldX >= 3420 && worldX <= 3450 && worldY >= 3550 && worldY <= 3580) return "62";
-            if (worldX >= 2800 && worldX <= 2850 && worldY >= 3650 && worldY <= 3700) return "72";
-            return "20+";
-        }
-        if (n.contains("obstacle pipe")) {
-            if (worldX >= 3000 && worldX <= 3030 && worldY >= 3370 && worldY <= 3400) return "5";
-            if (worldX >= 2880 && worldX <= 2900 && worldY >= 9790 && worldY <= 9820) return "70";
-            return "35+";
-        }
-        if (n.contains("scale rock") || n.contains("climb rock")) return "38+";
-        if (n.contains("rope swing")) return "35+";
-        if (n.contains("grapple")) return "21+";
-        return "1+";
-    }
-
-    private static boolean isAgilityObstacle(String name, int id) {
-        if (name == null) return false;
-        String n = name.toLowerCase();
-        if (n.contains("rough wall") || n.contains("tightrope") || n.contains("jump-gap") ||
-            (n.contains("gap") && !n.contains("glass")) || n.contains("balance beam") ||
-            n.contains("obstacle net") || n.contains("balancing rope") || n.contains("zip line") ||
-            n.contains("balancing ledge") || n.contains("climb ledge") || n.contains("edge") ||
-            n.contains("hurdle") || n.contains("stepping pad") || n.contains("pillar") ||
-            n.contains("skull slope") || n.contains("death slide") || n.contains("pyramid climbing") ||
-            n.contains("jump off") || n.contains("vault") || (n.contains("tree branch") && (id >= 23000 || id <= 16000))) {
-            return true;
-        }
-        return false;
-    }
-
-    private static String detectAgilityCourse(int playerX, int playerY) {
-        int regionId = ((playerX >> 6) << 8) | (playerY >> 6);
-        switch (regionId) {
-            case 9781:
-            case 9782: return "Gnome Stronghold";
-            case 12338:
-            case 12339: return "Draynor Village Rooftop";
-            case 13105:
-            case 13106: return "Al Kharid Rooftop";
-            case 12853:
-            case 12854: return "Varrock Rooftop";
-            case 13878:
-            case 13879: return "Canifis Rooftop";
-            case 12084:
-            case 12085: return "Falador Rooftop";
-            case 10806:
-            case 10807: return "Seers' Village Rooftop";
-            case 13358:
-            case 13359: return "Pollnivneach Rooftop";
-            case 10553:
-            case 10554: return "Rellekka Rooftop";
-            case 10547:
-            case 10548: return "Ardougne Rooftop";
-            case 13110:
-            case 13111: return "Prifddinas Course";
-            case 6448:
-            case 6449:
-            case 6704: return "Colossal Wyrm Course";
-            case 11050:
-            case 11051: return "Ape Atoll Course";
-            case 11836:
-            case 11837: return "Wilderness Course";
-            case 14134:
-            case 14135: return "Werewolf Course";
-            case 13356:
-            case 13357: return "Agility Pyramid";
-            case 10039:
-            case 10040: return "Barbarian Outpost";
-            case 10559: return "Penguin Course";
-            case 10835: return "Dorgesh-Kaan";
-            case 11157: return "Brimhaven Arena";
-            default: return "None";
-        }
-    }
-
-    private static String detectAgilityCourseLevel(String course) {
-        if (course == null) return "1";
-        switch (course) {
-            case "Gnome Stronghold": return "1";
-            case "Draynor Village Rooftop": return "10";
-            case "Al Kharid Rooftop": return "20";
-            case "Varrock Rooftop": return "30";
-            case "Canifis Rooftop": return "40";
-            case "Falador Rooftop": return "50";
-            case "Seers' Village Rooftop": return "60";
-            case "Pollnivneach Rooftop": return "70";
-            case "Rellekka Rooftop": return "80";
-            case "Ardougne Rooftop": return "90";
-            case "Prifddinas Course": return "75";
-            case "Colossal Wyrm Course": return "50";
-            case "Ape Atoll Course": return "48";
-            case "Wilderness Course": return "52";
-            case "Werewolf Course": return "60";
-            case "Agility Pyramid": return "30";
-            case "Barbarian Outpost": return "35";
-            case "Penguin Course": return "30";
-            case "Dorgesh-Kaan": return "70";
-            case "Brimhaven Arena": return "1";
-            default: return "-";
-        }
-    }
-
-    // -------------------------------------------------------------
-    // Minigames Detection (Pest Control, Wintertodt, Tempoross, GotR, etc.)
-    // -------------------------------------------------------------
-    private static void processRuneLiteMinigames(Object client, int playerX, int playerY, StringBuilder data) {
-        if (client == null) return;
-        try {
-            int regionId = ((playerX >> 6) << 8) | (playerY >> 6);
-            boolean active = false;
-            String name = "None";
-            String status = "Inactive";
-            String points = "0";
-            String extra = "-";
-
-            // 1. Pest Control (Region 10536, 10537, 10538 or widget 408 / 407)
-            if (regionId == 10536 || regionId == 10537 || regionId == 10538 || regionId == 10539 || getWidget(client, 408, 0) != null || getWidget(client, 407, 0) != null) {
-                active = true;
-                name = "Pest Control";
-                int pcPoints = getVarbitValue(client, 4087);
-                if (pcPoints >= 0) points = pcPoints + " Commendation Points";
-                Object gameWidget = getWidget(client, 408, 0);
-                if (gameWidget != null) {
-                    status = "In Game Instance";
-                    extra = "Shields Active / Defending Void Knight";
-                } else {
-                    status = "In Lander Boat";
-                    extra = regionId == 10538 ? "Veteran Boat" : (regionId == 10537 ? "Intermediate Boat" : "Novice Boat");
+            // 6. Scan NPCs for Bankers and Shops / Stores
+            try {
+                Object npcsObj = null;
+                if (topView != null) {
+                    npcsObj = invokeMethodQuietly(topView, "npcs");
+                    if (npcsObj == null) npcsObj = invokeMethodQuietly(topView, "getNpcs");
                 }
+                if (npcsObj == null) {
+                    npcsObj = invokeMethodQuietly(client, "getNpcs");
+                    if (npcsObj == null) npcsObj = invokeMethodQuietly(client, "npcs");
+                }
+                if (npcsObj != null) {
+                    Iterable<?> iterable = (npcsObj instanceof Iterable) ? (Iterable<?>) npcsObj : Arrays.asList((Object[]) npcsObj);
+                    for (Object npc : iterable) {
+                        if (npc == null) continue;
+                        int npcId = -1;
+                        Object idObj = invokeMethodQuietly(npc, "getId");
+                        if (idObj instanceof Integer) npcId = (Integer) idObj;
+                        String npcName = extractNpcName(client, npc, npcId);
+
+                        Object npcComp = invokeMethodQuietly(npc, "getComposition");
+                        if (npcComp != null) {
+                            Object imp = invokeMethodQuietly(npcComp, "getImpostor");
+                            if (imp != null) npcComp = imp;
+                        }
+                        if (npcComp == null && client != null && npcId > 0) {
+                            try {
+                                Method m = findMethod(client.getClass(), "getNpcDefinition", int.class);
+                                if (m == null) m = findMethod(client.getClass(), "getNpcComposition", int.class);
+                                if (m != null) npcComp = m.invoke(client, npcId);
+                            } catch (Throwable ignored) {}
+                        }
+
+                        boolean isBankerNpc = hasAction(npcComp, "bank", "exchange", "collect");
+                        boolean isShopNpc = hasAction(npcComp, "trade", "shop", "buy", "buy-items", "trade-with");
+
+                        int nx = playerX, ny = playerY;
+                        Object wp = invokeMethodQuietly(npc, "getWorldLocation");
+                        if (wp != null) {
+                            Object gx = invokeMethodQuietly(wp, "getX");
+                            Object gy = invokeMethodQuietly(wp, "getY");
+                            if (gx instanceof Integer) nx = (Integer) gx;
+                            if (gy instanceof Integer) ny = (Integer) gy;
+                        }
+                        int dist = Math.max(Math.abs(nx - playerX), Math.abs(ny - playerY));
+                        String lowerNpc = (npcName != null) ? npcName.toLowerCase() : "";
+
+                        if (isBankerNpc || lowerNpc.contains("banker") || lowerNpc.contains("bank ") || lowerNpc.contains("exchange clerk") || lowerNpc.contains("teller") || lowerNpc.contains("emerald benedict") || lowerNpc.contains("ghost banker") || lowerNpc.contains("gnome banker") || lowerNpc.contains("financial advisor")) {
+                            String bName = (npcName != null && !npcName.startsWith("NPC #")) ? npcName + " (NPC)" : "Banker (NPC)";
+                            bankEntries.add(new SceneEntry(dist, npcId, bName, nx, ny, "Banker"));
+                        } else if (isShopNpc || lowerNpc.contains("shop") || lowerNpc.contains("store") || lowerNpc.contains("trader") || lowerNpc.contains("merchant") || lowerNpc.contains("seller") || lowerNpc.contains("dealer") || lowerNpc.contains("keeper") || lowerNpc.contains("assistant") || lowerNpc.contains("vendor") || lowerNpc.contains("aubury") || lowerNpc.contains("zaff") || lowerNpc.contains("horvik") || lowerNpc.contains("bob") || lowerNpc.contains("brian") || lowerNpc.contains("thessalia") || lowerNpc.contains("lowe") || lowerNpc.contains("grum") || lowerNpc.contains("gerrant") || lowerNpc.contains("betty") || lowerNpc.contains("jatix") || lowerNpc.contains("cassie") || lowerNpc.contains("wayne") || lowerNpc.contains("pekit") || lowerNpc.contains("rommik") || lowerNpc.contains("farrad") || lowerNpc.contains("herquin") || lowerNpc.contains("wyd") || lowerNpc.contains("barker") || lowerNpc.contains("baker") || lowerNpc.contains("silk merchant") || lowerNpc.contains("fur trader") || lowerNpc.contains("gem merchant") || lowerNpc.contains("bartender") || lowerNpc.contains("barman") || lowerNpc.contains("waitress") || lowerNpc.contains("apothecary")) {
+                            String sName = (npcName != null && !npcName.startsWith("NPC #")) ? npcName + " (NPC)" : "Merchant (NPC)";
+                            shopEntries.add(new SceneEntry(dist, npcId, sName, nx, ny, "Shop"));
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            Collections.sort(treeEntries);
+            Collections.sort(bankEntries);
+            Collections.sort(shopEntries);
+            Collections.sort(altarEntries);
+            Collections.sort(rockEntries);
+            Collections.sort(shortcutEntries);
+            Collections.sort(obstacleEntries);
+            Collections.sort(groundItemEntries);
+
+            // Append Trees
+            int maxTrees = Math.min(treeEntries.size(), 40);
+            for (int i = 0; i < maxTrees; i++) {
+                SceneEntry e = treeEntries.get(i);
+                cachedSceneData.append("TREE[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY)
+                    .append(",").append(e.extra != null ? e.extra : "Available").append("\n");
             }
-            // 2. Wintertodt (Region 6462 or widget 396)
-            else if (regionId == 6462 || getWidget(client, 396, 0) != null) {
-                active = true;
-                name = "Wintertodt";
-                int wtPoints = getVarbitValue(client, 7980);
-                if (wtPoints >= 0) points = wtPoints + " Points";
-                int warmth = getVarbitValue(client, 5683);
-                status = warmth > 0 ? "Warmth: " + warmth + "%" : "Active Battle";
-                extra = "Pyromancers Active";
+            cachedSceneData.append("TOTAL_TREES: ").append(maxTrees).append("\n");
+
+            // Append Banks
+            int maxBanks = Math.min(bankEntries.size(), 20);
+            for (int i = 0; i < maxBanks; i++) {
+                SceneEntry e = bankEntries.get(i);
+                cachedSceneData.append("BANK_OBJ[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
             }
-            // 3. Tempoross (Region 12588, 12332, 12076 or widget 437)
-            else if (regionId == 12588 || regionId == 12332 || regionId == 12076 || getWidget(client, 437, 0) != null) {
-                active = true;
-                name = "Tempoross";
-                int storm = getVarbitValue(client, 11893);
-                int essence = getVarbitValue(client, 11894);
-                int energy = getVarbitValue(client, 11895);
-                status = "Storm: " + (storm >= 0 ? storm : 0) + "%";
-                points = "Energy: " + (energy >= 0 ? energy : 0) + "%, Essence: " + (essence >= 0 ? essence : 0) + "%";
-                extra = "Subduing Tempoross";
-            }
-            // 4. Guardians of the Rift (Region 14484, 14485 or widget 745)
-            else if (regionId == 14484 || regionId == 14485 || getWidget(client, 745, 0) != null) {
-                active = true;
-                name = "Guardians of the Rift";
-                status = "Great Guardian Active";
-                extra = "Catalytic / Elemental Energy";
-            }
-            // 5. Barbarian Assault (Region 7508, 7509, 10332 or widget 256 / 485)
-            else if (regionId == 7508 || regionId == 7509 || regionId == 10332 || getWidget(client, 256, 0) != null || getWidget(client, 485, 0) != null) {
-                active = true;
-                name = "Barbarian Assault";
-                status = "Wave Active";
-                extra = "Call Horn Active";
-            }
-            // 6. Castle Wars (Region 9520, 9776 or widget 58)
-            else if (regionId == 9520 || regionId == 9776 || getWidget(client, 58, 0) != null) {
-                active = true;
-                name = "Castle Wars";
-                status = "Game In Progress";
-                extra = "Saradomin vs Zamorak";
-            }
-            // 7. Soul Wars (Region 8792, 8793, 9048, 9049 or widget 685)
-            else if (regionId == 8792 || regionId == 8793 || regionId == 9048 || regionId == 9049 || getWidget(client, 685, 0) != null) {
-                active = true;
-                name = "Soul Wars";
-                status = "Game In Progress";
-                extra = "Avatar Battle";
-            }
-            // 8. Blast Furnace (Region 7757 or widget 474)
-            else if (regionId == 7757 || getWidget(client, 474, 0) != null) {
-                active = true;
-                name = "Blast Furnace";
-                status = "Furnace Operating";
-                extra = "Coffer Active";
-            }
-            // 9. Barrows (Region 14131, 14231, 14232)
-            else if (regionId == 14131 || regionId == 14231 || regionId == 14232) {
-                active = true;
-                name = "Barrows";
-                int slain = getVarbitValue(client, 457);
-                status = (slain >= 0 ? slain : 0) + "/6 Brothers Slain";
-                points = (slain >= 0 ? (slain * 100 / 6) : 0) + "% Potential";
-                extra = "Crypt / Tombs";
-            }
-            // 10. Fight Caves / Inferno / Fortis Colosseum
-            else if (regionId == 9551) {
-                active = true;
-                name = "Fight Caves";
-                status = "TzHaar Fight Cave";
-                extra = "TzTok-Jad Challenge";
-            } else if (regionId == 9043) {
-                active = true;
-                name = "The Inferno";
-                status = "Inferno Active";
-                extra = "TzKal-Zuk Challenge";
-            } else if (regionId == 7216) {
-                active = true;
-                name = "Fortis Colosseum";
-                status = "Colosseum Active";
-                extra = "Sol Heredit Challenge";
-            }
-            // 11. Nightmare Zone (Region 9033)
-            else if (regionId == 9033) {
-                active = true;
-                name = "Nightmare Zone";
-                status = "Dream Active";
-                extra = "Dominic Onion Dream";
-            }
-            // 12. Mage Training Arena (Region 13462, 13463)
-            else if (regionId == 13462 || regionId == 13463) {
-                active = true;
-                name = "Mage Training Arena";
-                status = "Training Active";
-                extra = "Pizazz Points";
-            }
-            // 13. Tithe Farm (Region 7222)
-            else if (regionId == 7222) {
-                active = true;
-                name = "Tithe Farm";
-                status = "Farming Active";
-                extra = "Hosidius Tithe Farm";
-            }
-            // 14. Volcanic Mine (Region 15263)
-            else if (regionId == 15263) {
-                active = true;
-                name = "Volcanic Mine";
-                status = "Mining Active";
-                extra = "Fossil Island Volcano";
-            }
-            // 15. Last Man Standing (Region 13658, 13659, 13914 or widget 328)
-            else if (regionId == 13658 || regionId == 13659 || regionId == 13914 || getWidget(client, 328, 0) != null) {
-                active = true;
-                name = "Last Man Standing";
-                status = "Battle Royale";
-                extra = "PvP Survival";
-            }
-            // 16. Mahogany Homes
-            int mhContract = getVarbitValue(client, 10594);
-            int mhPoints = getVarbitValue(client, 10595);
-            if (mhContract > 0) {
-                active = true;
-                name = "Mahogany Homes";
-                status = "Contract Active (Tier " + mhContract + ")";
-                if (mhPoints >= 0) points = mhPoints + " Carpenter Points";
-                extra = "Building Furniture";
+            cachedSceneData.append("TOTAL_BANKS: ").append(maxBanks).append("\n");
+            if (!bankEntries.isEmpty()) {
+                SceneEntry firstBank = bankEntries.get(0);
+                cachedSceneData.append("NEAREST_BANK: ").append(firstBank.name).append("\n");
+                cachedSceneData.append("NEAREST_BANK_DIST: ").append(firstBank.dist).append("\n");
+                cachedSceneData.append("IN_BANK: ").append(firstBank.dist <= 16 ? "True" : "False").append("\n");
             }
 
-            data.append("MINIGAME_ACTIVE: ").append(active ? "True" : "False").append("\n");
-            data.append("MINIGAME_NAME: ").append(name).append("\n");
-            data.append("MINIGAME_STATUS: ").append(status).append("\n");
-            data.append("MINIGAME_POINTS: ").append(points).append("\n");
-            data.append("MINIGAME_EXTRA: ").append(extra).append("\n");
+            // Append Shops
+            int maxShops = Math.min(shopEntries.size(), 20);
+            for (int i = 0; i < maxShops; i++) {
+                SceneEntry e = shopEntries.get(i);
+                cachedSceneData.append("SHOP_OBJ[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
+            }
+            cachedSceneData.append("TOTAL_SHOPS: ").append(maxShops).append("\n");
+
+            // Append Altars
+            int maxAltars = Math.min(altarEntries.size(), 20);
+            for (int i = 0; i < maxAltars; i++) {
+                SceneEntry e = altarEntries.get(i);
+                cachedSceneData.append("ALTAR_OBJ[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
+            }
+            cachedSceneData.append("TOTAL_ALTARS: ").append(maxAltars).append("\n");
+
+            // Append Rocks
+            int maxRocks = Math.min(rockEntries.size(), 30);
+            for (int i = 0; i < maxRocks; i++) {
+                SceneEntry e = rockEntries.get(i);
+                cachedSceneData.append("ROCK_OBJ[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
+            }
+            cachedSceneData.append("TOTAL_ROCKS: ").append(maxRocks).append("\n");
+
+            // Append Shortcuts & Obstacles
+            int maxShortcuts = Math.min(shortcutEntries.size(), 25);
+            for (int i = 0; i < maxShortcuts; i++) {
+                SceneEntry e = shortcutEntries.get(i);
+                cachedSceneData.append("SHORTCUT[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.extra).append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
+            }
+            cachedSceneData.append("TOTAL_SHORTCUTS: ").append(maxShortcuts).append("\n");
+
+            int maxObstacles = Math.min(obstacleEntries.size(), 25);
+            for (int i = 0; i < maxObstacles; i++) {
+                SceneEntry e = obstacleEntries.get(i);
+                cachedSceneData.append("OBSTACLE[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.extra).append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
+            }
+            cachedSceneData.append("TOTAL_OBSTACLES: ").append(maxObstacles).append("\n");
+
+            // Append Ground Items
+            int maxGroundItems = Math.min(groundItemEntries.size(), 40);
+            for (int i = 0; i < maxGroundItems; i++) {
+                SceneEntry e = groundItemEntries.get(i);
+                cachedSceneData.append("GROUND_ITEM[").append(i).append("]: ").append(e.id).append(",").append(e.name)
+                    .append(",").append(e.extra).append(",").append(e.dist).append(",").append(e.worldX).append(",").append(e.worldY).append("\n");
+            }
+            cachedSceneData.append("TOTAL_GROUND_ITEMS: ").append(maxGroundItems).append("\n");
+
+            lastSceneScanTime = now;
+            lastScenePlayerX = playerX;
+            lastScenePlayerY = playerY;
+            lastScenePlane = plane;
+
+            data.append(cachedSceneData);
         } catch (Throwable ignored) {}
+    }
+
+    private static void scanSceneObject(Object client, Object obj, int dist, int worldX, int worldY, int playerX, int playerY) {
+        int id = getObjectId(obj);
+        if (id <= 0) return;
+
+        Object comp = getObjectComposition(client, obj, id);
+        if (comp != null) {
+            Object imp = invokeMethodQuietly(comp, "getImpostor");
+            if (imp != null) comp = imp;
+        }
+
+        String name = null;
+        if (comp != null) {
+            Object nameObj = invokeMethodQuietly(comp, "getName");
+            if (nameObj instanceof String) {
+                name = cleanName((String) nameObj);
+            }
+        }
+        if (name == null || name.isEmpty() || "null".equalsIgnoreCase(name)) {
+            name = extractObjectName(client, obj, id);
+        }
+
+        int actualWorldX = worldX;
+        int actualWorldY = worldY;
+        Object wp = invokeMethodQuietly(obj, "getWorldLocation");
+        if (wp != null) {
+            Object gx = invokeMethodQuietly(wp, "getX");
+            Object gy = invokeMethodQuietly(wp, "getY");
+            if (gx instanceof Integer && gy instanceof Integer && ((Integer) gx) > 0) {
+                actualWorldX = (Integer) gx;
+                actualWorldY = (Integer) gy;
+            }
+        }
+        int actualDist = Math.max(Math.abs(actualWorldX - playerX), Math.abs(actualWorldY - playerY));
+
+        boolean isKnownBank = KNOWN_BANK_OBJECT_IDS.contains(id);
+        boolean hasBankAction = hasAction(comp, "bank", "open-bank", "exchange", "collect", "deposit");
+        boolean hasShopAction = hasAction(comp, "trade", "shop", "buy", "buy-items", "trade-with", "value");
+        boolean hasChopAction = hasAction(comp, "chop down", "chop", "cut", "pick-fruit", "pick");
+        boolean hasMineAction = hasAction(comp, "mine", "prospect", "chip", "quarry");
+
+        String lower = (name != null) ? name.toLowerCase() : "";
+
+        if (hasChopAction || lower.contains("tree") || lower.contains("oak") || lower.contains("willow") || lower.contains("maple")
+            || lower.contains("yew") || lower.contains("magic") || lower.contains("redwood") || lower.contains("teak") || lower.contains("mahogany")
+            || lower.contains("sapling") || lower.contains("pine") || lower.contains("hollow") || lower.contains("achey") || lower.contains("juniper")
+            || lower.contains("blisterwood") || lower.contains("sulliuscep") || lower.contains("roots") || lower.contains("evergreen") || lower.contains("bark") || lower.contains("tendril")) {
+            String status = (lower.contains("stump") || lower.contains("depleted")) ? "Stump" : "Available";
+            treeEntries.add(new SceneEntry(actualDist, id, (name != null && !name.isEmpty() && !name.startsWith("Object #")) ? name : "Tree", actualWorldX, actualWorldY, status));
+        } else if (isKnownBank || hasBankAction || lower.contains("bank") || lower.contains("booth") || lower.contains("chest") || lower.contains("deposit box") || lower.contains("grand exchange") || lower.contains("vault") || lower.contains("counter") || lower.contains("teller") || lower.contains("desk") || lower.contains("safe")) {
+            String bankName = (name != null && !name.startsWith("Object #")) ? name : "Bank Booth";
+            bankEntries.add(new SceneEntry(actualDist, id, bankName, actualWorldX, actualWorldY, null));
+        } else if (hasShopAction || lower.contains("shop") || lower.contains("store") || lower.contains("stall") || lower.contains("counter") || lower.contains("merchant") || lower.contains("trader") || lower.contains("market") || lower.contains("stand") || lower.contains("rack") || lower.contains("display") || lower.contains("cart") || lower.contains("vendor")) {
+            String shopName = (name != null && !name.startsWith("Object #")) ? name : "Shop / Stall";
+            shopEntries.add(new SceneEntry(actualDist, id, shopName, actualWorldX, actualWorldY, null));
+        } else if (lower.contains("altar") || lower.contains("shrine") || lower.contains("pool") || lower.contains("font") || lower.contains("statue")) {
+            altarEntries.add(new SceneEntry(actualDist, id, name, actualWorldX, actualWorldY, null));
+        } else if (hasMineAction || lower.contains("rock") || lower.contains("ore") || lower.contains("vein") || lower.contains("mining") || lower.contains("deposit") || lower.contains("amethyst") || lower.contains("dense runestone") || lower.contains("sandstone") || lower.contains("granite") || lower.contains("clay") || lower.contains("salt") || lower.contains("basalt") || lower.contains("daeyalt") || lower.contains("volcanic ash") || lower.contains("coal") || lower.contains("mithril") || lower.contains("adamantite") || lower.contains("runite") || lower.contains("iron") || lower.contains("copper") || lower.contains("tin") || lower.contains("gold") || lower.contains("silver")) {
+            String rockName = (name != null && !name.startsWith("Object #")) ? name : "Mining Rock";
+            rockEntries.add(new SceneEntry(actualDist, id, rockName, actualWorldX, actualWorldY, null));
+        } else if (lower.contains("shortcut") || lower.contains("underwall") || lower.contains("stepping stone") || lower.contains("gap") || lower.contains("crevice") || lower.contains("tunnel")) {
+            shortcutEntries.add(new SceneEntry(actualDist, id, name, actualWorldX, actualWorldY, "1"));
+        } else if (lower.contains("obstacle") || lower.contains("log balance") || lower.contains("rope") || lower.contains("pipe") || lower.contains("tightrope") || lower.contains("hurdle") || lower.contains("ledge") || lower.contains("climb") || lower.contains("plank") || lower.contains("zip line")) {
+            obstacleEntries.add(new SceneEntry(actualDist, id, name, actualWorldX, actualWorldY, "Agility"));
+        }
     }
 
     private static int getObjectId(Object obj) {
         if (obj == null) return -1;
+        Object idObj = invokeMethodQuietly(obj, "getId");
+        return (idObj instanceof Integer) ? (Integer) idObj : -1;
+    }
+
+    private static void processCombatAndEntities(Object client, Object player, String localPlayerName, int playerX, int playerY, int plane, StringBuilder data) {
+        if (client == null) return;
         try {
-            Method m = obj.getClass().getMethod("getId");
-            m.setAccessible(true);
-            return (Integer) m.invoke(obj);
+            boolean inCombat = false;
+            boolean underAttack = false;
+            String underAttackBy = "None";
+            attackingEnemiesList.clear();
+
+            Object directTarget = (player != null) ? invokeMethodQuietly(player, "getInteracting") : null;
+            Object combatTargetActor = directTarget;
+            int targetIndex = -1;
+
+            // 1. Process NPCs
+            Object npcsObj = null;
+            Object topView = invokeMethodQuietly(client, "getTopLevelWorldView");
+            if (topView != null) {
+                npcsObj = invokeMethodQuietly(topView, "npcs");
+                if (npcsObj == null) npcsObj = invokeMethodQuietly(topView, "getNpcs");
+            }
+            if (npcsObj == null) {
+                npcsObj = invokeMethodQuietly(client, "getNpcs");
+                if (npcsObj == null) npcsObj = invokeMethodQuietly(client, "npcs");
+            }
+
+            int npcCount = 0;
+            if (npcsObj != null) {
+                Iterable<?> iterable = (npcsObj instanceof Iterable) ? (Iterable<?>) npcsObj : Arrays.asList((Object[]) npcsObj);
+                for (Object npc : iterable) {
+                    if (npc == null || npcCount >= 25) continue;
+
+                    int npcId = -1;
+                    Object idObj = invokeMethodQuietly(npc, "getId");
+                    if (idObj instanceof Integer) npcId = (Integer) idObj;
+
+                    String npcName = extractNpcName(client, npc, npcId);
+                    int cbLevel = 0;
+                    Object cbObj = invokeMethodQuietly(npc, "getCombatLevel");
+                    if (cbObj instanceof Integer) cbLevel = (Integer) cbObj;
+
+                    int anim = -1;
+                    Object aObj = invokeMethodQuietly(npc, "getAnimation");
+                    if (aObj instanceof Integer) anim = (Integer) aObj;
+
+                    int hpRatio = -1;
+                    Object hrObj = invokeMethodQuietly(npc, "getHealthRatio");
+                    if (hrObj instanceof Integer) hpRatio = (Integer) hrObj;
+                    int hpPct = (hpRatio >= 0) ? hpRatio : 100;
+
+                    int nx = playerX, ny = playerY;
+                    Object wp = invokeMethodQuietly(npc, "getWorldLocation");
+                    if (wp != null) {
+                        Object gx = invokeMethodQuietly(wp, "getX");
+                        Object gy = invokeMethodQuietly(wp, "getY");
+                        if (gx instanceof Integer) nx = (Integer) gx;
+                        if (gy instanceof Integer) ny = (Integer) gy;
+                    }
+                    int dist = Math.max(Math.abs(nx - playerX), Math.abs(ny - playerY));
+
+                    boolean targetingMe = false;
+                    boolean npcInCombat = false;
+                    Object npcTarget = invokeMethodQuietly(npc, "getInteracting");
+                    if (npcTarget != null) {
+                        npcInCombat = true;
+                        Object tn = invokeMethodQuietly(npcTarget, "getName");
+                        String targetName = (tn instanceof String) ? cleanName((String) tn) : "None";
+                        if (player != null && (npcTarget == player || npcTarget.equals(player) || (localPlayerName != null && !localPlayerName.isEmpty() && localPlayerName.equalsIgnoreCase(targetName)))) {
+                            targetingMe = true;
+                            underAttack = true;
+                            if ("None".equals(underAttackBy)) underAttackBy = npcName;
+                            if (!attackingEnemiesList.contains(npcName)) attackingEnemiesList.add(npcName);
+                            inCombat = true;
+                            if (combatTargetActor == null) {
+                                combatTargetActor = npc;
+                                targetIndex = npcCount;
+                            }
+                        }
+                    }
+
+                    if (directTarget != null && directTarget == npc) {
+                        combatTargetActor = npc;
+                        targetIndex = npcCount;
+                        inCombat = true;
+                    }
+
+                    // Format: <id>,<name>,<hp%>,<worldX>,<worldY>,<plane>,<dist>,<inCombat>,<anim>,<targetingMe>
+                    data.append("NPC[").append(npcCount).append("]: ").append(npcId).append(",").append(npcName)
+                        .append(",").append(hpPct).append(",").append(nx).append(",").append(ny)
+                        .append(",").append(plane).append(",").append(dist)
+                        .append(",").append(npcInCombat ? "True" : "False")
+                        .append(",").append(anim).append(",").append(targetingMe ? "True" : "False").append("\n");
+                    npcCount++;
+                }
+            }
+            data.append("TOTAL_NPCS: ").append(npcCount).append("\n");
+
+            // 2. Process Players
+            Object playersObj = null;
+            if (topView != null) {
+                playersObj = invokeMethodQuietly(topView, "players");
+                if (playersObj == null) playersObj = invokeMethodQuietly(topView, "getPlayers");
+            }
+            if (playersObj == null) {
+                playersObj = invokeMethodQuietly(client, "getPlayers");
+                if (playersObj == null) playersObj = invokeMethodQuietly(client, "players");
+            }
+
+            int playerCount = 0;
+            if (playersObj != null) {
+                Iterable<?> iterable = (playersObj instanceof Iterable) ? (Iterable<?>) playersObj : Arrays.asList((Object[]) playersObj);
+                for (Object p : iterable) {
+                    if (p == null || p == player || playerCount >= 20) continue;
+
+                    String pName = "Player";
+                    Object nameObj = invokeMethodQuietly(p, "getName");
+                    if (nameObj instanceof String) pName = cleanName((String) nameObj);
+
+                    int cb = 0;
+                    Object cbObj = invokeMethodQuietly(p, "getCombatLevel");
+                    if (cbObj instanceof Integer) cb = (Integer) cbObj;
+
+                    int anim = -1;
+                    Object animObj = invokeMethodQuietly(p, "getAnimation");
+                    if (animObj instanceof Integer) anim = (Integer) animObj;
+
+                    int px = playerX, py = playerY;
+                    Object wp = invokeMethodQuietly(p, "getWorldLocation");
+                    if (wp != null) {
+                        Object gx = invokeMethodQuietly(wp, "getX");
+                        Object gy = invokeMethodQuietly(wp, "getY");
+                        if (gx instanceof Integer) px = (Integer) gx;
+                        if (gy instanceof Integer) py = (Integer) gy;
+                    }
+                    int dist = Math.max(Math.abs(px - playerX), Math.abs(py - playerY));
+
+                    String interacting = "None";
+                    boolean targetingMe = false;
+                    Object inter = invokeMethodQuietly(p, "getInteracting");
+                    if (inter != null) {
+                        Object inName = invokeMethodQuietly(inter, "getName");
+                        if (inName instanceof String) interacting = cleanName((String) inName);
+                        if (player != null && (inter == player || inter.equals(player) || (localPlayerName != null && !localPlayerName.isEmpty() && localPlayerName.equalsIgnoreCase(interacting)))) {
+                            targetingMe = true;
+                            underAttack = true;
+                            if ("None".equals(underAttackBy)) underAttackBy = pName;
+                            if (!attackingEnemiesList.contains(pName)) attackingEnemiesList.add(pName);
+                            inCombat = true;
+                            if (combatTargetActor == null) {
+                                combatTargetActor = p;
+                                targetIndex = playerCount;
+                            }
+                        }
+                    }
+
+                    if (directTarget != null && directTarget == p) {
+                        combatTargetActor = p;
+                        targetIndex = playerCount;
+                        inCombat = true;
+                    }
+
+                    data.append("PLAYER[").append(playerCount).append("]: ").append(pName).append(",").append(cb)
+                        .append(",").append(px).append(",").append(py).append(",").append(plane)
+                        .append(",").append(dist).append(",").append(anim).append(",").append(interacting).append("\n");
+                    playerCount++;
+                }
+            }
+            data.append("TOTAL_PLAYERS: ").append(playerCount).append("\n");
+
+            // 3. Resolve and Stream Unified Combat State
+            if (combatTargetActor != null) {
+                inCombat = true;
+                String clName = combatTargetActor.getClass().getName().toLowerCase();
+                boolean isPlr = clName.contains("player");
+
+                String tName = "None";
+                int tCb = 0;
+                int tAnim = -1;
+                int tPose = -1;
+                int tDist = 0;
+                String tHpStr = "100%";
+
+                Object nObj = invokeMethodQuietly(combatTargetActor, "getName");
+                if (nObj instanceof String) tName = cleanName((String) nObj);
+                if ((tName.isEmpty() || "None".equalsIgnoreCase(tName) || "null".equalsIgnoreCase(tName)) && !isPlr) {
+                    int cid = -1;
+                    Object idObj = invokeMethodQuietly(combatTargetActor, "getId");
+                    if (idObj instanceof Integer) cid = (Integer) idObj;
+                    tName = extractNpcName(client, combatTargetActor, cid);
+                }
+
+                Object cbObj = invokeMethodQuietly(combatTargetActor, "getCombatLevel");
+                if (cbObj instanceof Integer) tCb = (Integer) cbObj;
+
+                Object animObj = invokeMethodQuietly(combatTargetActor, "getAnimation");
+                if (animObj instanceof Integer) tAnim = (Integer) animObj;
+
+                Object poseObj = invokeMethodQuietly(combatTargetActor, "getPoseAnimation");
+                if (poseObj instanceof Integer) tPose = (Integer) poseObj;
+
+                Object hrObj = invokeMethodQuietly(combatTargetActor, "getHealthRatio");
+                if (hrObj instanceof Integer && ((Integer) hrObj) >= 0) {
+                    tHpStr = hrObj + "%";
+                }
+
+                Object wp = invokeMethodQuietly(combatTargetActor, "getWorldLocation");
+                if (wp != null) {
+                    Object gx = invokeMethodQuietly(wp, "getX");
+                    Object gy = invokeMethodQuietly(wp, "getY");
+                    if (gx instanceof Integer && gy instanceof Integer) {
+                        tDist = Math.max(Math.abs(((Integer) gx) - playerX), Math.abs(((Integer) gy) - playerY));
+                    }
+                }
+
+                String overhead = extractOverheadPrayer(combatTargetActor);
+
+                lastCombatTarget = tName;
+                lastCombatTargetIndex = targetIndex;
+                lastCombatTargetLevel = tCb;
+                lastCombatTargetHp = tHpStr;
+                lastCombatTargetDistance = tDist;
+                lastCombatTargetPrayer = overhead;
+                lastCombatTargetAnim = tAnim;
+                lastCombatTargetPose = tPose;
+
+                if (isPlr) {
+                    lastCombatTargetGear.clear();
+                    extractPlayerEquipment(combatTargetActor, lastCombatTargetGear, lastEnemyEquipIds, lastEnemyEquipNames);
+                    for (int s = 0; s < 14; s++) {
+                        if (lastEnemyEquipIds[s] > 0) {
+                            data.append("ENEMY_EQUIP[").append(s).append("]: ").append(lastEnemyEquipIds[s]).append(",").append(lastEnemyEquipNames[s]).append("\n");
+                        } else {
+                            data.append("ENEMY_EQUIP[").append(s).append("]: EMPTY\n");
+                        }
+                    }
+                    String weapon = (lastEnemyEquipNames[3] != null && !"EMPTY".equals(lastEnemyEquipNames[3])) ? lastEnemyEquipNames[3] : "None";
+                    lastCombatTargetWeapon = weapon;
+                    data.append("COMBAT_ENEMY_WEAPON: ").append(weapon).append("\n");
+                    data.append("ENEMY_WEAPON: ").append(weapon).append("\n");
+                    if (!lastCombatTargetGear.isEmpty()) {
+                        String gearStr = String.join(", ", lastCombatTargetGear);
+                        data.append("COMBAT_ENEMY_GEAR: ").append(gearStr).append("\n");
+                        data.append("ENEMY_GEAR: ").append(gearStr).append("\n");
+                    } else {
+                        data.append("COMBAT_ENEMY_GEAR: None\n");
+                        data.append("ENEMY_GEAR: None\n");
+                    }
+                } else {
+                    for (int s = 0; s < 14; s++) {
+                        data.append("ENEMY_EQUIP[").append(s).append("]: EMPTY\n");
+                    }
+                    lastCombatTargetWeapon = "None";
+                    data.append("COMBAT_ENEMY_WEAPON: None\n");
+                    data.append("ENEMY_WEAPON: None\n");
+                    data.append("COMBAT_ENEMY_GEAR: None\n");
+                    data.append("ENEMY_GEAR: None\n");
+                }
+
+                data.append("COMBAT_TARGET: ").append(tName).append("\n");
+                data.append("COMBAT_TARGET_INDEX: ").append(targetIndex).append("\n");
+                data.append("COMBAT_TARGET_LEVEL: ").append(tCb).append("\n");
+                data.append("COMBAT_TARGET_HP: ").append(tHpStr).append("\n");
+                data.append("COMBAT_TARGET_DISTANCE: ").append(tDist).append("\n");
+                data.append("COMBAT_ENEMY_PRAYER: ").append(overhead).append("\n");
+                data.append("ENEMY_PRAYER: ").append(overhead).append("\n");
+                data.append("COMBAT_ENEMY_ANIMATION: ").append(tAnim).append("\n");
+                data.append("TARGET_ANIMATION: ").append(tAnim).append("\n");
+                data.append("COMBAT_ENEMY_POSE: ").append(tPose).append("\n");
+                data.append("COMBAT: IN_COMBAT: True | TARGET: ").append(tName).append(" | HP: ").append(tHpStr).append(" | LEVEL: ").append(tCb).append(" | UNDER_ATTACK: ").append(underAttack ? "True" : "False").append("\n");
+            } else {
+                for (int s = 0; s < 14; s++) {
+                    data.append("ENEMY_EQUIP[").append(s).append("]: EMPTY\n");
+                }
+                data.append("COMBAT_TARGET: None\n");
+                data.append("COMBAT_TARGET_INDEX: -1\n");
+                data.append("COMBAT_TARGET_LEVEL: 0\n");
+                data.append("COMBAT_TARGET_HP: None\n");
+                data.append("COMBAT_TARGET_DISTANCE: 0\n");
+                data.append("COMBAT_ENEMY_PRAYER: None\n");
+                data.append("ENEMY_PRAYER: None\n");
+                data.append("COMBAT_ENEMY_WEAPON: None\n");
+                data.append("ENEMY_WEAPON: None\n");
+                data.append("COMBAT_ENEMY_GEAR: None\n");
+                data.append("ENEMY_GEAR: None\n");
+                data.append("COMBAT: IN_COMBAT: ").append(inCombat ? "True" : "False").append(" | TARGET: None | HP: None | LEVEL: 0 | UNDER_ATTACK: ").append(underAttack ? "True" : "False").append("\n");
+            }
+
+            // Attacker state
+            data.append("COMBAT_UNDER_ATTACK: ").append(underAttack ? "True" : "False").append("\n");
+            data.append("UNDER_ATTACK: ").append(underAttack ? "True" : "False").append("\n");
+            data.append("UNDER_ATTACK_BY: ").append(underAttackBy).append("\n");
+            data.append("COMBAT_ATTACKING_ENEMIES: ").append(!attackingEnemiesList.isEmpty() ? String.join(", ", attackingEnemiesList) : "None").append("\n");
+            data.append("IN_COMBAT: ").append(inCombat ? "True" : "False").append("\n");
+
+        } catch (Throwable ignored) {}
+    }
+
+    private static String extractActiveTab(Object client) {
+        if (client == null) return "Inventory";
+        try {
+            Object tabObj = invokeMethodQuietly(client, "getVarcIntValue", 171);
+            if (tabObj instanceof Integer) {
+                int tab = (Integer) tabObj;
+                switch (tab) {
+                    case 0: return "Combat";
+                    case 1: return "Skills";
+                    case 2: return "Quests";
+                    case 3: return "Inventory";
+                    case 4: return "Equipment";
+                    case 5: return "Prayer";
+                    case 6: return "Magic";
+                    case 7: return "Clan";
+                    case 8: return "Account";
+                    case 9: return "Friends";
+                    case 10: return "Logout";
+                    case 11: return "Settings";
+                    case 12: return "Emotes";
+                    case 13: return "Music";
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "Inventory";
+    }
+
+    private static String extractOverheadPrayer(Object actor) {
+        if (actor == null) return "None";
+        try {
+            Object icon = invokeMethodQuietly(actor, "getOverheadIcon");
+            if (icon == null) icon = invokeMethodQuietly(actor, "getHeadIcon");
+            if (icon instanceof Enum) {
+                String name = ((Enum<?>) icon).name().toUpperCase();
+                if (name.contains("MELEE")) return "Protect from Melee";
+                if (name.contains("RANG") || name.contains("MISSILE")) return "Protect from Missiles";
+                if (name.contains("MAGIC") || name.contains("MAGE")) return "Protect from Magic";
+                if (name.contains("SMITE")) return "Smite";
+                if (name.contains("REDEMPTION")) return "Redemption";
+                if (name.contains("RETRIBUTION")) return "Retribution";
+                return name;
+            }
+        } catch (Throwable ignored) {}
+        return "None";
+    }
+
+    private static void extractPlayerEquipment(Object targetPlayer, List<String> outGearNames, int[] outEquipIds, String[] outEquipNames) {
+        if (targetPlayer == null) return;
+        try {
+            Object comp = invokeMethodQuietly(targetPlayer, "getPlayerComposition");
+            if (comp == null) return;
+
+            Object equipIdsObj = invokeMethodQuietly(comp, "getEquipmentIds");
+            if (equipIdsObj instanceof int[]) {
+                int[] rawIds = (int[]) equipIdsObj;
+                for (int slot = 0; slot < 14; slot++) {
+                    int rawId = (slot < rawIds.length) ? rawIds[slot] : -1;
+                    int itemId = rawId;
+                    if (itemId > 512) itemId -= 512;
+                    if (itemId > 0 && itemId != 65535) {
+                        outEquipIds[slot] = itemId;
+                        String itmName = resolveItemName(itemId);
+                        outEquipNames[slot] = itmName;
+                        outGearNames.add(itmName);
+                    } else {
+                        outEquipIds[slot] = -1;
+                        outEquipNames[slot] = "EMPTY";
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void processDialogue(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            // Widget 231 (NPC dialogue), 219 (Options), 229 (Player/Messagebox)
+            Object widget = getWidget(client, 231, 6);
+            if (widget != null) {
+                Object textObj = invokeMethodQuietly(widget, "getText");
+                if (textObj instanceof String) {
+                    String text = cleanName((String) textObj);
+                    if (!text.isEmpty()) {
+                        Object npcTitle = getWidget(client, 231, 4);
+                        String npcName = "NPC";
+                        if (npcTitle != null) {
+                            Object nObj = invokeMethodQuietly(npcTitle, "getText");
+                            if (nObj instanceof String) npcName = cleanName((String) nObj);
+                        }
+                        data.append("DIALOG_NPC_NAME: ").append(npcName).append("\n");
+                        data.append("DIALOG_TEXT: ").append(text).append("\n");
+                        return;
+                    }
+                }
+            }
+
+            Object msgWidget = getWidget(client, 229, 1);
+            if (msgWidget != null) {
+                Object textObj = invokeMethodQuietly(msgWidget, "getText");
+                if (textObj instanceof String) {
+                    String text = cleanName((String) textObj);
+                    if (!text.isEmpty()) {
+                        data.append("DIALOG_TEXT: ").append(text).append("\n");
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void processPrayers(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            Class<?> prayerEnum = null;
+            try {
+                prayerEnum = Class.forName("net.runelite.api.Prayer", true, client.getClass().getClassLoader());
+            } catch (Throwable ignored) {
+                try {
+                    prayerEnum = Class.forName("net.runelite.api.Prayer");
+                } catch (Throwable ignored2) {}
+            }
+
+            Method isPrayerActive = null;
+            if (prayerEnum != null && prayerEnum.isEnum()) {
+                isPrayerActive = findMethod(client.getClass(), "isPrayerActive", prayerEnum);
+            }
+
+            int prayerVarp = getVarpValue(client, 83);
+            List<String> activePrayersList = new ArrayList<>(8);
+
+            for (int bit = 0; bit < STANDARD_PRAYERS_MAP.length; bit++) {
+                Object[] row = STANDARD_PRAYERS_MAP[bit];
+                String formattedName = (String) row[0];
+                String enumName = (String) row[1];
+                int varbitId = (Integer) row[2];
+
+                boolean isActive = false;
+
+                // 1. Check Varp 83 bitmask (OSRS native active prayers bitmask)
+                if (prayerVarp > 0 && (prayerVarp & (1 << bit)) != 0) {
+                    isActive = true;
+                }
+
+                // 2. Check RuneLite isPrayerActive
+                if (!isActive && isPrayerActive != null && prayerEnum != null) {
+                    try {
+                        for (Object p : prayerEnum.getEnumConstants()) {
+                            if (p instanceof Enum && ((Enum<?>) p).name().equalsIgnoreCase(enumName)) {
+                                Object active = isPrayerActive.invoke(client, p);
+                                if (Boolean.TRUE.equals(active)) {
+                                    isActive = true;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+
+                // 3. Check Varbit
+                if (!isActive && varbitId > 0) {
+                    int vb = getVarbitValue(client, varbitId);
+                    if (vb == 1) isActive = true;
+                }
+
+                if (isActive) {
+                    activePrayersList.add(formattedName);
+                    data.append("PRAYER[").append(formattedName).append("]: Active\n");
+                    data.append("PRAYER[").append(enumName).append("]: Active\n");
+                } else {
+                    data.append("PRAYER[").append(formattedName).append("]: Inactive\n");
+                    data.append("PRAYER[").append(enumName).append("]: Inactive\n");
+                }
+            }
+
+            // Quick Prayers
+            int quickPrayerVarb = getVarbitValue(client, 4103);
+            int quickPrayerVarp = getVarpValue(client, 84);
+            boolean quickPrayerActive = (quickPrayerVarb == 1 || quickPrayerVarp > 0);
+            data.append("QUICK_PRAYER: ").append(quickPrayerActive ? "True" : "False").append("\n");
+
+            // Summary
+            if (!activePrayersList.isEmpty()) {
+                StringBuilder ap = new StringBuilder();
+                for (int i = 0; i < activePrayersList.size(); i++) {
+                    if (i > 0) ap.append(", ");
+                    ap.append(activePrayersList.get(i));
+                }
+                data.append("ACTIVE_PRAYERS: ").append(ap).append("\n");
+                data.append("ACTIVE_PRAYER_COUNT: ").append(activePrayersList.size()).append("\n");
+            } else {
+                data.append("ACTIVE_PRAYERS: None\n");
+                data.append("ACTIVE_PRAYER_COUNT: 0\n");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static Object getWidget(Object client, int group, int child) {
+        if (client == null) return null;
+        try {
+            Method m = findMethod(client.getClass(), "getWidget", int.class, int.class);
+            if (m != null) return m.invoke(client, group, child);
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static int getVarbitValue(Object client, int varbitId) {
+        if (client == null || varbitId < 0) return -1;
+        try {
+            Method m = findMethod(client.getClass(), "getVarbitValue", int.class);
+            if (m != null) {
+                Object res = m.invoke(client, varbitId);
+                if (res instanceof Number) return ((Number) res).intValue();
+            }
         } catch (Throwable ignored) {}
         return -1;
     }
 
-    private static String classifyObject(String name, int id) {
-        if (name == null) return "Other";
-        String n = name.toLowerCase();
-        if (n.contains("tree") || n.contains("oak") || n.contains("willow") || n.contains("teak") ||
-            n.contains("maple") || n.contains("mahogany") || n.contains("yew") || n.contains("magic") ||
-            n.contains("redwood") || n.contains("blisterwood") || n.contains("pine") || n.contains("juniper") ||
-            n.contains("evergreen") || n.contains("dead tree") || n.contains("sulliuscep") || n.contains("stump")) {
-            return "Tree";
-        }
-        if (n.contains("bank") || n.contains("grand exchange booth") || n.contains("deposit box")) {
-            return "Bank";
-        }
-        if (n.contains("shop") || n.contains("counter") || n.contains("general store") || n.contains("stall") || n.contains("trading post")) {
-            return "Shop";
-        }
-        if (n.contains("altar") || n.contains("pool") || n.contains("fountain of rune") || n.contains("statuette")) {
-            return "Altar";
-        }
-        if (n.contains("rocks") || n.contains("ore") || n.contains("vein") || n.contains("amethyst")) {
-            return "Rock";
-        }
-        return "Other";
+    private static int getVarpValue(Object client, int varpId) {
+        if (client == null || varpId < 0) return -1;
+        try {
+            Method m = findMethod(client.getClass(), "getVarpValue", int.class);
+            if (m != null) {
+                Object res = m.invoke(client, varpId);
+                if (res instanceof Number) return ((Number) res).intValue();
+            }
+            Method mVarps = findMethod(client.getClass(), "getVarps");
+            if (mVarps != null) {
+                Object res = mVarps.invoke(client);
+                if (res instanceof int[]) {
+                    int[] varps = (int[]) res;
+                    if (varpId < varps.length) return varps[varpId];
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
     }
 
-    private static boolean isStump(String name, int id) {
-        if (name != null && name.toLowerCase().contains("stump")) return true;
-        return (id >= 1342 && id <= 1359);
+    private static void processBuffsAndStatusTimers(Object client, StringBuilder data) {
+        if (client == null) return;
+        try {
+            // 1. Stamina Potion
+            int stamina = getVarbitValue(client, 25);
+            if (stamina >= 0) {
+                data.append("BUFF_STAMINA: ").append(stamina).append("\n");
+            }
+
+            // 2. Antifire Potions
+            int antifire = getVarbitValue(client, 3981);
+            if (antifire < 0) antifire = getVarpValue(client, 3975);
+            if (antifire >= 0) {
+                data.append("BUFF_ANTIFIRE: ").append(antifire).append("\n");
+            }
+
+            int superAntifire = getVarbitValue(client, 6101);
+            if (superAntifire >= 0) {
+                data.append("BUFF_SUPER_ANTIFIRE: ").append(superAntifire).append("\n");
+            }
+
+            // 3. Overload (NMZ: 3955, CoX: 5418)
+            int ovlNmz = getVarbitValue(client, 3955);
+            int ovlCox = getVarbitValue(client, 5418);
+            int ovl = Math.max(ovlNmz >= 0 ? ovlNmz : 0, ovlCox >= 0 ? ovlCox : 0);
+            if (ovl > 0) {
+                data.append("BUFF_OVERLOAD: ").append(ovl).append("\n");
+            } else if (ovlNmz >= 0 || ovlCox >= 0) {
+                data.append("BUFF_OVERLOAD: 0\n");
+            }
+
+            // 4. Divine Potions
+            int dSuper = getVarbitValue(client, 8429);
+            int dRange = getVarbitValue(client, 8430);
+            int dMage = getVarbitValue(client, 8431);
+            int dBast = getVarbitValue(client, 8432);
+            int dBattle = getVarbitValue(client, 8433);
+            int divine = Math.max(dSuper, Math.max(dRange, Math.max(dMage, Math.max(dBast, dBattle))));
+            if (divine > 0) {
+                data.append("BUFF_DIVINE: ").append(divine).append("\n");
+            } else if (dSuper >= 0) {
+                data.append("BUFF_DIVINE: 0\n");
+            }
+
+            // 5. Imbued Heart / Saturated Heart Cooldown
+            int heart = getVarbitValue(client, 5440);
+            if (heart < 0) heart = getVarpValue(client, 1243);
+            if (heart >= 0) {
+                data.append("BUFF_IMBUED_HEART: ").append(heart).append("\n");
+            }
+
+            // 6. Prayer Enhance (CoX)
+            int prayEnhance = getVarbitValue(client, 5451);
+            if (prayEnhance >= 0) {
+                data.append("BUFF_PRAYER_ENHANCE: ").append(prayEnhance).append("\n");
+            }
+
+            // 7. Charge Spell
+            int charge = getVarbitValue(client, 272);
+            if (charge >= 0) {
+                data.append("BUFF_CHARGE: ").append(charge).append("\n");
+            }
+
+            // 8. Poison & Venom Status (Varp 102)
+            int poisonVarp = getVarpValue(client, 102);
+            if (poisonVarp >= 1000000) {
+                int venomDmg = 6 + (int) Math.min(14, ((poisonVarp - 1000000) / 5) * 2);
+                data.append("POISON_STATE: Venomed\n");
+                data.append("POISON_DAMAGE: ").append(venomDmg).append("\n");
+                data.append("POISON_IMMUNITY_TICKS: 0\n");
+            } else if (poisonVarp > 0) {
+                int poisonDmg = (int) Math.ceil(poisonVarp / 5.0);
+                data.append("POISON_STATE: Poisoned\n");
+                data.append("POISON_DAMAGE: ").append(poisonDmg).append("\n");
+                data.append("POISON_IMMUNITY_TICKS: 0\n");
+            } else if (poisonVarp < 0) {
+                int immunityTicks = -poisonVarp;
+                data.append("POISON_STATE: Immune\n");
+                data.append("POISON_DAMAGE: 0\n");
+                data.append("POISON_IMMUNITY_TICKS: ").append(immunityTicks).append("\n");
+            } else if (poisonVarp == 0) {
+                data.append("POISON_STATE: Normal\n");
+                data.append("POISON_DAMAGE: 0\n");
+                data.append("POISON_IMMUNITY_TICKS: 0\n");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static String resolveItemName(int id) {
+        if (id <= 0 || id == 65535) return "Empty";
+        String cached = ITEM_NAME_CACHE.get(id);
+        if (cached != null) return cached;
+
+        if (runeLiteItemManager != null) {
+            try {
+                Method m = findMethod(runeLiteItemManager.getClass(), "getItemComposition", int.class);
+                if (m != null) {
+                    Object comp = m.invoke(runeLiteItemManager, id);
+                    if (comp != null) {
+                        Object nameObj = invokeMethodQuietly(comp, "getName");
+                        if (nameObj instanceof String) {
+                            String name = cleanName((String) nameObj);
+                            if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                                ITEM_NAME_CACHE.put(id, name);
+                                return name;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        if (runeLiteClient != null) {
+            try {
+                Method m = findMethod(runeLiteClient.getClass(), "getItemDefinition", int.class);
+                if (m == null) m = findMethod(runeLiteClient.getClass(), "getItemComposition", int.class);
+                if (m != null) {
+                    Object comp = m.invoke(runeLiteClient, id);
+                    if (comp != null) {
+                        Object nameObj = invokeMethodQuietly(comp, "getName");
+                        if (nameObj instanceof String) {
+                            String name = cleanName((String) nameObj);
+                            if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                                ITEM_NAME_CACHE.put(id, name);
+                                return name;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        return "Item #" + id;
+    }
+
+    private static Object getObjectComposition(Object client, Object obj, int id) {
+        if (obj != null) {
+            try {
+                Object comp = invokeMethodQuietly(obj, "getComposition");
+                if (comp != null) return comp;
+            } catch (Throwable ignored) {}
+        }
+        if (client != null && id > 0) {
+            try {
+                Method m = findMethod(client.getClass(), "getObjectComposition", int.class);
+                if (m == null) m = findMethod(client.getClass(), "getObjectDefinition", int.class);
+                if (m != null) {
+                    return m.invoke(client, id);
+                }
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    private static boolean hasAction(Object comp, String... targetActions) {
+        if (comp == null || targetActions == null) return false;
+        try {
+            Object actionsObj = invokeMethodQuietly(comp, "getActions");
+            if (actionsObj instanceof String[]) {
+                for (String act : (String[]) actionsObj) {
+                    if (act == null) continue;
+                    String actLower = act.toLowerCase();
+                    for (String t : targetActions) {
+                        if (actLower.contains(t.toLowerCase())) return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    public static String resolveLocationName(int x, int y, int plane, int regionId) {
+        if (x <= 0 || y <= 0) return "Unknown";
+
+        // 1. Specific Coordinate Bounding Boxes
+        // Grand Exchange
+        if (x >= 3140 && x <= 3190 && y >= 3470 && y <= 3515) return "Grand Exchange";
+
+        // Varrock Areas
+        if (x >= 3160 && x <= 3205 && y >= 3400 && y <= 3460) return "West Varrock";
+        if (x >= 3235 && x <= 3285 && y >= 3400 && y <= 3460) return "East Varrock";
+        if (x >= 3206 && x <= 3234 && y >= 3415 && y <= 3445) return "Varrock Square";
+        if (x >= 3190 && x <= 3235 && y >= 3460 && y <= 3500) return "Varrock Palace";
+        if (x >= 3200 && x <= 3250 && y >= 3370 && y <= 3414) return "South Varrock";
+        if (x >= 3180 && x <= 3280 && y >= 9840 && y <= 9920) return "Varrock Sewers";
+        if (x >= 3180 && x <= 3205 && y >= 3350 && y <= 3375) return "Champions' Guild";
+
+        // Edgeville & Barbarian Village
+        if (x >= 3070 && x <= 3120 && y >= 3460 && y <= 3520) return "Edgeville";
+        if (x >= 3040 && x <= 3065 && y >= 3480 && y <= 3505) return "Edgeville Monastery";
+        if (x >= 3080 && x <= 3140 && y >= 9840 && y <= 10000) return "Edgeville Dungeon";
+        if (x >= 3070 && x <= 3115 && y >= 3410 && y <= 3455) return "Barbarian Village";
+
+        // Lumbridge
+        if (x >= 3210 && x <= 3235 && y >= 3210 && y <= 3230) return "Lumbridge Castle";
+        if (x >= 3200 && x <= 3255 && y >= 3190 && y <= 3240) return "Lumbridge";
+        if (x >= 3145 && x <= 3250 && y >= 3150 && y <= 3185) return "Lumbridge Swamp";
+        if (x >= 3180 && x <= 3200 && y >= 3290 && y <= 3315) return "Lumbridge Windmill";
+
+        // Draynor & Wizards Tower
+        if (x >= 3075 && x <= 3120 && y >= 3220 && y <= 3270) return "Draynor Village";
+        if (x >= 3080 && x <= 3130 && y >= 3330 && y <= 3380) return "Draynor Manor";
+        if (x >= 3100 && x <= 3125 && y >= 3150 && y <= 3175) return "Wizards' Tower";
+
+        // Al Kharid & Desert
+        if (x >= 3265 && x <= 3320 && y >= 3140 && y <= 3200) return "Al Kharid";
+        if (x >= 3280 && x <= 3310 && y >= 3150 && y <= 3180) return "Al Kharid Palace";
+        if (x >= 3325 && x <= 3390 && y >= 3200 && y <= 3285) return "PvP Arena";
+        if (x >= 3290 && x <= 3320 && y >= 3110 && y <= 3135) return "Shantay Pass";
+
+        // Falador & Asgarnia
+        if (x >= 2995 && x <= 3040 && y >= 3340 && y <= 3390) return "East Falador";
+        if (x >= 2940 && x <= 2994 && y >= 3340 && y <= 3390) return "West Falador";
+        if (x >= 2955 && x <= 3000 && y >= 3320 && y <= 3350) return "Falador Castle";
+        if (x >= 2985 && x <= 3035 && y >= 3365 && y <= 3400) return "Falador Park";
+        if (x >= 3010 && x <= 3060 && y >= 9690 && y <= 9750) return "Mining Guild";
+        if (x >= 3000 && x <= 3070 && y >= 3200 && y <= 3265) return "Port Sarim";
+        if (x >= 2935 && x <= 2985 && y >= 3195 && y <= 3250) return "Rimmington";
+        if (x >= 2925 && x <= 2950 && y >= 3275 && y <= 3300) return "Crafting Guild";
+        if (x >= 2870 && x <= 2940 && y >= 3420 && y <= 3480) return "Taverley";
+        if (x >= 2815 && x <= 2940 && y >= 9740 && y <= 9860) return "Taverley Dungeon";
+        if (x >= 2870 && x <= 2940 && y >= 3520 && y <= 3580) return "Burthorpe";
+        if (x >= 2835 && x <= 2880 && y >= 3530 && y <= 3560) return "Warriors' Guild";
+        if (x >= 3030 && x <= 3060 && y >= 4950 && y <= 4980) return "Rogues' Den";
+
+        // Kandarin
+        if (x >= 2790 && x <= 2860 && y >= 3415 && y <= 3460) return "Catherby";
+        if (x >= 2690 && x <= 2750 && y >= 3460 && y <= 3510) return "Seers' Village";
+        if (x >= 2745 && x <= 2780 && y >= 3490 && y <= 3525) return "Camelot Castle";
+        if (x >= 2580 && x <= 2630 && y >= 3390 && y <= 3445) return "Fishing Guild";
+        if (x >= 2655 && x <= 2678 && y >= 3415 && y <= 3445) return "Ranging Guild";
+        if (x >= 2600 && x <= 2680 && y >= 3260 && y <= 3340) return "East Ardougne";
+        if (x >= 2500 && x <= 2560 && y >= 3260 && y <= 3340) return "West Ardougne";
+        if (x >= 2415 && x <= 2485 && y >= 3400 && y <= 3480) return "Tree Gnome Stronghold";
+        if (x >= 2460 && x <= 2475 && y >= 3490 && y <= 3505) return "The Grand Tree";
+        if (x >= 2520 && x <= 2550 && y >= 3160 && y <= 3190) return "Tree Gnome Village";
+        if (x >= 2530 && x <= 2620 && y >= 3070 && y <= 3115) return "Yanille";
+        if (x >= 2435 && x <= 2465 && y >= 3080 && y <= 3110) return "Castle Wars";
+
+        // Karamja & Mor Ul Rek
+        if (x >= 2910 && x <= 2960 && y >= 3130 && y <= 3180) return "Karamja (Musa Point)";
+        if (x >= 2740 && x <= 2800 && y >= 3140 && y <= 3200) return "Brimhaven";
+        if (x >= 2630 && x <= 2750 && y >= 9400 && y <= 9600) return "Brimhaven Dungeon";
+        if (x >= 2430 && x <= 2560 && y >= 5120 && y <= 5185) return "TzHaar City";
+        if (x >= 2820 && x <= 2880 && y >= 2950 && y <= 3000) return "Shilo Village";
+
+        // Morytania
+        if (x >= 3470 && x <= 3515 && y >= 3470 && y <= 3515) return "Canifis";
+        if (x >= 3650 && x <= 3700 && y >= 3460 && y <= 3510) return "Port Phasmatys";
+        if (x >= 3550 && x <= 3580 && y >= 3270 && y <= 3310) return "Barrows";
+        if (x >= 3470 && x <= 3520 && y >= 3260 && y <= 3310) return "Mort'ton";
+
+        // Great Kourend & Kebos
+        if (x >= 1660 && x <= 1820 && y >= 3480 && y <= 3640) return "Hosidius";
+        if (x >= 1560 && x <= 1600 && y >= 3470 && y <= 3510) return "Woodcutting Guild";
+        if (x >= 1215 && x <= 1270 && y >= 3710 && y <= 3760) return "Farming Guild";
+        if (x >= 1590 && x <= 1680 && y >= 3650 && y <= 3720) return "Kourend Castle";
+        if (x >= 1460 && x <= 1590 && y >= 3530 && y <= 3650) return "Shayzien";
+        if (x >= 1750 && x <= 1860 && y >= 3660 && y <= 3810) return "Port Piscarilius";
+        if (x >= 1400 && x <= 1550 && y >= 3720 && y <= 3880) return "Lovakengj";
+        if (x >= 1600 && x <= 1750 && y >= 3720 && y <= 3880) return "Arceuus";
+        if (x >= 1600 && x <= 1730 && y >= 9980 && y <= 10110) return "Catacombs of Kourend";
+
+        // Fremennik
+        if (x >= 2620 && x <= 2700 && y >= 3630 && y <= 3700) return "Rellekka";
+        if (x >= 2070 && x <= 2150 && y >= 3880 && y <= 3950) return "Lunar Isle";
+        if (x >= 2500 && x <= 2600 && y >= 3830 && y <= 3900) return "Miscellania";
+        if (x >= 2300 && x <= 2370 && y >= 3780 && y <= 3840) return "Neitiznot";
+        if (x >= 2380 && x <= 2440 && y >= 3780 && y <= 3840) return "Jatizso";
+
+        // Wilderness
+        if (y >= 3520 && x >= 2940 && x <= 3400) {
+            int wildyLevel = (y - 3520) / 8 + 1;
+            if (x >= 3125 && x <= 3160 && y >= 3620 && y <= 3650) return "Ferox Enclave (Safe)";
+            if (x >= 3075 && x <= 3125 && y >= 3940 && y <= 3970) return "Mage Arena (Wildy Lvl " + wildyLevel + ")";
+            if (x >= 3225 && x <= 3245 && y >= 3630 && y <= 3650) return "Chaos Temple (Wildy Lvl " + wildyLevel + ")";
+            if (x >= 3050 && x <= 3100 && y >= 3830 && y <= 3880) return "Lava Maze (Wildy Lvl " + wildyLevel + ")";
+            if (x >= 3275 && x <= 3305 && y >= 3925 && y <= 3950) return "Rogues' Castle (Wildy Lvl " + wildyLevel + ")";
+            if (x >= 3360 && x <= 3390 && y >= 3885 && y <= 3910) return "Fountain of Rune (Wildy Lvl " + wildyLevel + ")";
+            return "Wilderness (Lvl " + wildyLevel + ")";
+        }
+
+        // Region ID fallbacks
+        switch (regionId) {
+            case 12597: return "West Varrock";
+            case 12853: return "East Varrock";
+            case 12598: return "Grand Exchange";
+            case 12850: return "Lumbridge";
+            case 11828: return "Falador";
+            case 12342: return "Edgeville";
+            case 12338: return "Draynor";
+            case 13105: case 13106: return "Al Kharid";
+            case 12341: return "Barbarian Village";
+            case 12082: return "Port Sarim";
+            case 11826: return "Rimmington";
+            case 10806: return "Seers' Village";
+            case 11062: return "Catherby";
+            case 10291: case 10292: case 10547: case 10548: return "Ardougne";
+            case 11571: case 11572: return "Taverley";
+            case 11573: case 11829: return "Burthorpe";
+            case 10288: return "Yanille";
+            case 11568: case 11569: case 11824: case 11825: return "Karamja";
+            case 13878: case 13877: case 14134: return "Canifis";
+            case 6963: case 6964: case 7219: case 7220: return "Hosidius";
+            default:
+                if (regionId > 0) return "Region #" + regionId;
+                return "Gielinor";
+        }
     }
 
     private static String extractObjectName(Object client, Object obj, int id) {
@@ -3466,99 +2050,159 @@ public class BytecodeAgent {
         String cached = OBJECT_NAME_CACHE.get(id);
         if (cached != null) return cached;
 
-        // 1. obj.getComposition() / obj.getDefinition()
         if (obj != null) {
-            for (String cm : new String[]{"getComposition", "getTransformedComposition", "getDefinition"}) {
-                try {
-                    Method m = obj.getClass().getMethod(cm);
-                    m.setAccessible(true);
-                    Object comp = m.invoke(obj);
-                    if (comp != null) {
-                        try {
-                            Method getName = comp.getClass().getMethod("getName");
-                            getName.setAccessible(true);
-                            Object res = getName.invoke(comp);
-                            if (res instanceof String) {
-                                String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                                if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("null-name")) {
-                                    OBJECT_NAME_CACHE.put(id, s);
-                                    return s;
-                                }
-                            }
-                        } catch (Throwable ignored) {}
+            try {
+                Object comp = invokeMethodQuietly(obj, "getComposition");
+                if (comp != null) {
+                    Object imp = invokeMethodQuietly(comp, "getImpostor");
+                    if (imp != null) comp = imp;
+                    Object nameObj = invokeMethodQuietly(comp, "getName");
+                    if (nameObj instanceof String) {
+                        String name = cleanName((String) nameObj);
+                        if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                            OBJECT_NAME_CACHE.put(id, name);
+                            return name;
+                        }
                     }
-                } catch (Throwable ignored) {}
-            }
+                }
+            } catch (Throwable ignored) {}
         }
 
-        // 2. Query client for ObjectComposition
         if (client != null) {
-            for (String cm : new String[]{"getObjectDefinition", "loadObjectComposition", "getObjectComposition"}) {
-                try {
-                    Method m = client.getClass().getMethod(cm, int.class);
-                    m.setAccessible(true);
+            try {
+                Method m = findMethod(client.getClass(), "getObjectComposition", int.class);
+                if (m == null) m = findMethod(client.getClass(), "getObjectDefinition", int.class);
+                if (m != null) {
                     Object comp = m.invoke(client, id);
                     if (comp != null) {
-                        try {
-                            Method getName = comp.getClass().getMethod("getName");
-                            getName.setAccessible(true);
-                            Object res = getName.invoke(comp);
-                            if (res instanceof String) {
-                                String s = ((String) res).replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
-                                if (!s.isEmpty() && !s.equalsIgnoreCase("null") && !s.equalsIgnoreCase("null-name")) {
-                                    OBJECT_NAME_CACHE.put(id, s);
-                                    return s;
+                        Object imp = invokeMethodQuietly(comp, "getImpostor");
+                        if (imp != null) comp = imp;
+                        Object nameObj = invokeMethodQuietly(comp, "getName");
+                        if (nameObj instanceof String) {
+                            String name = cleanName((String) nameObj);
+                            if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                                OBJECT_NAME_CACHE.put(id, name);
+                                return name;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        return "Object #" + id;
+    }
+
+    private static String extractNpcName(Object client, Object npc, int id) {
+        if (npc != null) {
+            Object nameObj = invokeMethodQuietly(npc, "getName");
+            if (nameObj instanceof String) {
+                String name = cleanName((String) nameObj);
+                if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                    if (id > 0) NPC_NAME_CACHE.put(id, name);
+                    return name;
+                }
+            }
+
+            try {
+                Object comp = invokeMethodQuietly(npc, "getComposition");
+                if (comp == null) comp = invokeMethodQuietly(npc, "getTransformedComposition");
+                if (comp != null) {
+                    Object imp = invokeMethodQuietly(comp, "getImpostor");
+                    if (imp != null) comp = imp;
+                    Object cName = invokeMethodQuietly(comp, "getName");
+                    if (cName instanceof String) {
+                        String name = cleanName((String) cName);
+                        if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                            if (id > 0) NPC_NAME_CACHE.put(id, name);
+                            return name;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        if (id > 0) {
+            String cached = NPC_NAME_CACHE.get(id);
+            if (cached != null) return cached;
+
+            if (client != null) {
+                try {
+                    Method m = findMethod(client.getClass(), "getNPCComposition", int.class);
+                    if (m == null) m = findMethod(client.getClass(), "getNpcDefinition", int.class);
+                    if (m != null) {
+                        Object comp = m.invoke(client, id);
+                        if (comp != null) {
+                            Object imp = invokeMethodQuietly(comp, "getImpostor");
+                            if (imp != null) comp = imp;
+                            Object nameObj = invokeMethodQuietly(comp, "getName");
+                            if (nameObj instanceof String) {
+                                String name = cleanName((String) nameObj);
+                                if (!name.isEmpty() && !"null".equalsIgnoreCase(name)) {
+                                    NPC_NAME_CACHE.put(id, name);
+                                    return name;
                                 }
                             }
-                        } catch (Throwable ignored) {}
+                        }
                     }
                 } catch (Throwable ignored) {}
             }
         }
-
-        // 3. Builtin object name dictionary
-        String builtin = getBuiltinObjectName(id);
-        if (builtin != null) {
-            OBJECT_NAME_CACHE.put(id, builtin);
-            return builtin;
-        }
-
-        return "Object_" + id;
+        return "NPC #" + (id > 0 ? id : 0);
     }
 
-    private static String getBuiltinObjectName(int id) {
-        switch (id) {
-            case 1276: case 1278: return "Tree";
-            case 1281: return "Oak tree";
-            case 1308: case 5551: case 5552: case 5553: return "Willow tree";
-            case 1307: return "Maple tree";
-            case 1309: return "Yew tree";
-            case 1306: return "Magic tree";
-            case 34007: return "Redwood tree";
-            case 9036: return "Teak tree";
-            case 9034: return "Mahogany tree";
-            case 1342: return "Oak tree stump";
-            case 1343: return "Willow tree stump";
-            case 1344: return "Maple tree stump";
-            case 1345: return "Yew tree stump";
-            case 1346: return "Magic tree stump";
-            case 10355: case 10356: case 10357: case 10083: case 24101: case 24347: case 26711: case 27267:
-            case 27292: case 28430: case 28431: case 28432: case 28433: case 28546: case 28547: case 28548:
-            case 28549: case 36786: case 39239: case 4483: case 16642: return "Bank booth";
-            case 10517: case 26254: case 25937: return "Bank deposit box";
-            case 10060: case 10061: return "Grand Exchange booth";
-            case 409: case 410: case 411: case 412: return "Altar";
-            case 11360: case 11361: return "Iron rocks";
-            case 11364: case 11365: return "Coal rocks";
-            case 11366: case 11367: return "Mithril rocks";
-            case 11368: case 11369: return "Adamantite rocks";
-            case 11370: case 11371: return "Runite rocks";
-            case 11362: case 11363: return "Silver rocks";
-            case 11372: case 11373: return "Gold rocks";
-            case 11374: case 11375: return "Clay rocks";
-            case 11376: case 11377: return "Copper rocks";
-            case 11378: case 11379: return "Tin rocks";
-            default: return null;
+    private static String cleanName(String name) {
+        if (name == null) return "";
+        return name.replaceAll("<[^>]*>", "").replace('\u00A0', ' ').trim();
+    }
+
+    // -------------------------------------------------------------
+    // Reflection Cache & Helpers
+    // -------------------------------------------------------------
+    private static Method findMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
+        if (clazz == null || name == null) return null;
+        String cacheKey = clazz.getName() + '#' + name + (paramTypes != null && paramTypes.length > 0 ? '#' + paramTypes[0].getName() : "");
+        Method cached = METHOD_CACHE.get(cacheKey);
+        if (cached != null) return cached == NULL_METHOD_MARKER ? null : cached;
+
+        Method found = null;
+        try {
+            found = (paramTypes == null || paramTypes.length == 0) ? clazz.getMethod(name) : clazz.getMethod(name, paramTypes);
+        } catch (Throwable ignored) {
+            for (Method m : clazz.getMethods()) {
+                if (m.getName().equalsIgnoreCase(name)) {
+                    if (paramTypes == null || paramTypes.length == 0 || m.getParameterCount() == paramTypes.length) {
+                        found = m;
+                        break;
+                    }
+                }
+            }
         }
+
+        if (found != null) {
+            try { found.setAccessible(true); } catch (Throwable ignored) {}
+        }
+        METHOD_CACHE.put(cacheKey, found != null ? found : NULL_METHOD_MARKER);
+        return found;
+    }
+
+    private static Object invokeMethodQuietly(Object target, String methodName, Object... args) {
+        if (target == null || methodName == null) return null;
+        try {
+            Class<?>[] paramTypes = null;
+            if (args != null && args.length > 0) {
+                paramTypes = new Class<?>[args.length];
+                for (int i = 0; i < args.length; i++) {
+                    paramTypes[i] = args[i] != null ? args[i].getClass() : Object.class;
+                    if (paramTypes[i] == Integer.class) paramTypes[i] = int.class;
+                    else if (paramTypes[i] == Long.class) paramTypes[i] = long.class;
+                    else if (paramTypes[i] == Boolean.class) paramTypes[i] = boolean.class;
+                }
+            }
+            Method m = findMethod(target.getClass(), methodName, paramTypes);
+            if (m != null) {
+                return (args == null || args.length == 0) ? m.invoke(target) : m.invoke(target, args);
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 }

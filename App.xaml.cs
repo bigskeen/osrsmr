@@ -33,22 +33,35 @@ public partial class App : Application
             LogFatalError("AppDomain Unhandled Exception", ex.ExceptionObject as Exception);
         
         DispatcherUnhandledException += (s, ex) => {
-            LogFatalError("Dispatcher Unhandled Exception", ex.Exception);
-            ex.Handled = true;
-        };
-
-        // Also catch Task exceptions
-        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (s, ex) => {
-            LogFatalError("Task Exception", ex.Exception);
-            ex.SetObserved();
-        };
-
-        AppDomain.CurrentDomain.ProcessExit += (s, ex) => {
-            try
+            try {
+                string msg = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Dispatcher Exception: {ex.Exception?.Message}\n{ex.Exception?.StackTrace}\n";
+                if (ex.Exception?.InnerException != null)
+                {
+                    msg += $"Inner Exception: {ex.Exception.InnerException.Message}\n{ex.Exception.InnerException.StackTrace}\n";
+                }
+                File.AppendAllText("error_log.txt", msg);
+                File.AppendAllText("attach_log.txt", $"[DISPATCHER_EXCEPTION] {ex.Exception?.Message}\n");
+            } catch { }
+            
+            // If main window hasn't loaded or isn't visible, this is a fatal startup crash
+            if (MainWindow == null || !MainWindow.IsLoaded || !MainWindow.IsVisible)
             {
-                Environment.Exit(0);
+                LogFatalError("Startup Dispatcher Exception", ex.Exception);
             }
-            catch { }
+            else
+            {
+                ex.Handled = true;
+            }
+        };
+
+        // Also catch Task exceptions and log without terminating app
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (s, ex) => {
+            try {
+                string msg = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Unobserved Task Exception: {ex.Exception?.Message}\n{ex.Exception?.StackTrace}\n";
+                File.AppendAllText("error_log.txt", msg);
+                File.AppendAllText("attach_log.txt", $"[TASK_EXCEPTION] {ex.Exception?.Message}\n");
+            } catch { }
+            ex.SetObserved();
         };
 
         base.OnStartup(e);
@@ -73,7 +86,13 @@ public partial class App : Application
         }
         
         try {
-            File.AppendAllText("crash_log.txt", $"\n[{DateTime.Now}] FATAL CRASH\n{message}\n");
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string crashLogPath = Path.Combine(baseDir, "crash_log.txt");
+            string formatted = $"\n[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] FATAL CRASH\n{message}\n";
+            File.AppendAllText(crashLogPath, formatted);
+            File.AppendAllText("crash_log.txt", formatted);
+            File.AppendAllText("error_log.txt", formatted);
+            File.AppendAllText("attach_log.txt", $"[FATAL_CRASH] {type}: {ex?.Message}\n");
         } catch { }
 
         MessageBox.Show(message, "OSRS Bridge Crash", MessageBoxButton.OK, MessageBoxImage.Error);
