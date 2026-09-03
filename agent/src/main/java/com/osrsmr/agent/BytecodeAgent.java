@@ -208,7 +208,7 @@ public class BytecodeAgent {
                             writer = null;
                         }
                     }
-                    Thread.sleep(20);
+                    Thread.sleep(50);
                 }
             } catch (Exception ignored) {}
         }, "RuneLite-Telemetry-Worker");

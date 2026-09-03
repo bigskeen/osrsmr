@@ -29,7 +29,9 @@ namespace osrsmr;
 public partial class MainWindow : Window
 {
     private readonly ObservableCollection<DataItem> _dataItems = new();
+    private readonly Dictionary<string, DataItem> _dataItemsIndex = new(StringComparer.OrdinalIgnoreCase);
     private readonly ObservableCollection<DataItem> _skills = new();
+    private readonly Dictionary<string, DataItem> _skillsIndex = new(StringComparer.OrdinalIgnoreCase);
     private readonly ObservableCollection<SkillProgressItem> _displayedSkills = new();
     private string _currentSkillFilter = "All";
     private readonly ObservableCollection<NpcItem> _npcs = new();
@@ -56,6 +58,7 @@ public partial class MainWindow : Window
     private readonly List<CustomScriptDefinition> _savedCustomScripts = new();
     private readonly Dictionary<string, PrayerViewModel> _prayerMap = new(StringComparer.OrdinalIgnoreCase);
     private readonly Border[] _inventorySlots = new Border[28];
+    private readonly string[] _lastInventoryRaw = new string[28];
     private class InventorySlotHolder
     {
         public Border Border { get; set; } = null!;
@@ -71,6 +74,21 @@ public partial class MainWindow : Window
     private static readonly SolidColorBrush SlotOccupiedBg = new SolidColorBrush(Color.FromRgb(24, 48, 76));
     private static readonly SolidColorBrush SlotOccupiedBorder = new SolidColorBrush(Color.FromRgb(0, 180, 216));
     private readonly Dictionary<string, Border> _equipmentSlots = new();
+
+    private void SetDataItem(string key, string value)
+    {
+        if (_dataItemsIndex.TryGetValue(key, out var existing))
+        {
+            if (existing.Value != value)
+                existing.Value = value;
+        }
+        else
+        {
+            var item = new DataItem { Key = key, Value = value };
+            _dataItemsIndex[key] = item;
+            _dataItems.Add(item);
+        }
+    }
     private readonly DispatcherTimer _botTimer = new();
     private TcpListener? _listener;
     private bool _running = true;
@@ -305,14 +323,8 @@ public partial class MainWindow : Window
         
         // Update diagnostic info
         _ = Dispatcher.BeginInvoke(() => {
-            var existing = _dataItems.FirstOrDefault(i => i.Key == "Agent Link");
-            string val = $"Connected (#{sessionId}) at {DateTime.Now.ToLongTimeString()}";
-            if (existing != null) existing.Value = val;
-            else _dataItems.Add(new DataItem { Key = "Agent Link", Value = val });
-
-            var clientMode = _dataItems.FirstOrDefault(i => i.Key == "Client Mode");
-            if (clientMode != null) clientMode.Value = "RuneLite Java Agent";
-            else _dataItems.Add(new DataItem { Key = "Client Mode", Value = "RuneLite Java Agent" });
+            SetDataItem("Agent Link", $"Connected (#{sessionId}) at {DateTime.Now.ToLongTimeString()}");
+            SetDataItem("Client Mode", "RuneLite Java Agent");
         });
 
         try
@@ -362,9 +374,14 @@ public partial class MainWindow : Window
         try { BrainEngine.Instance.ProcessLine(line); } catch { }
 
         _incomingLines.Enqueue(line);
+        if (_incomingLines.Count > 3000)
+        {
+            while (_incomingLines.Count > 1500 && _incomingLines.TryDequeue(out _)) { }
+        }
+
         if (System.Threading.Interlocked.CompareExchange(ref _isDispatcherScheduled, 1, 0) == 0)
         {
-            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Normal, (Action)DrainIncomingLines);
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, (Action)DrainIncomingLines);
         }
     }
 
@@ -372,14 +389,14 @@ public partial class MainWindow : Window
     {
         System.Threading.Interlocked.Exchange(ref _isDispatcherScheduled, 0);
         int count = 0;
-        while (count < 800 && _incomingLines.TryDequeue(out var line))
+        while (count < 250 && _incomingLines.TryDequeue(out var line))
         {
             ProcessLineOnUi(line);
             count++;
         }
         if (!_incomingLines.IsEmpty && System.Threading.Interlocked.CompareExchange(ref _isDispatcherScheduled, 1, 0) == 0)
         {
-            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Normal, (Action)DrainIncomingLines);
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, (Action)DrainIncomingLines);
         }
     }
 
@@ -442,7 +459,6 @@ public partial class MainWindow : Window
                     if (int.TryParse(value, out int totLvl))
                     {
                         SkillTrackerEngine.Instance.TotalLevel = totLvl;
-                        RefreshSkillsDisplay();
                     }
                 }
                 else if (key == "TOTAL_XP")
@@ -450,40 +466,23 @@ public partial class MainWindow : Window
                     if (long.TryParse(value, out long totXp))
                     {
                         SkillTrackerEngine.Instance.TotalXp = totXp;
-                        RefreshSkillsDisplay();
                     }
                 }
                 else if (key == "PID")
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == "Client PID");
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = "Client PID", Value = value });
+                    SetDataItem("Client PID", value);
                 }
                 else if (key == "Status" || key == "Status:")
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == "Agent Status");
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = "Agent Status", Value = value });
+                    SetDataItem("Agent Status", value);
                 }
                 else if (key == "Client Class" || key == "Client Class:")
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == key);
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = key, Value = value });
+                    SetDataItem(key, value);
                 }
                 else if (key == "Searching for Game Client...")
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == "Discovery");
-                    if (existing != null)
-                        existing.Value = "Scanning...";
-                    else
-                        _dataItems.Add(new DataItem { Key = "Discovery", Value = "Scanning..." });
+                    SetDataItem("Discovery", "Scanning...");
                 }
                 else if (key == "GameState" || key == "ENGINE_STATE" || key == "Game State")
                 {
@@ -523,11 +522,7 @@ public partial class MainWindow : Window
                         }
                     }
                     
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == key);
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = key, Value = value });
+                    SetDataItem(key, value);
                 }
                 else if (key == "PLAYER_NAME")
                 {
@@ -599,11 +594,7 @@ public partial class MainWindow : Window
                 }
                 else if (key == "PLAYER_X" || key == "PLAYER_Y")
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == key);
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = key, Value = value });
+                    SetDataItem(key, value);
                         
                     if (key == "PLAYER_X" && int.TryParse(value, out int px)) _currentX = px;
                     if (key == "PLAYER_Y" && int.TryParse(value, out int py)) _currentY = py;
@@ -688,11 +679,7 @@ public partial class MainWindow : Window
                 }
                 else if (key == "LOCATION_STATUS")
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == key);
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = key, Value = value });
+                    SetDataItem(key, value);
                 }
                 else if (key.StartsWith("TREE["))
                 {
@@ -950,11 +937,7 @@ public partial class MainWindow : Window
                 }
                 else
                 {
-                    var existing = _dataItems.FirstOrDefault(i => i.Key == key);
-                    if (existing != null)
-                        existing.Value = value;
-                    else
-                        _dataItems.Add(new DataItem { Key = key, Value = value });
+                    SetDataItem(key, value);
                 }
             }
         }
@@ -1347,11 +1330,16 @@ public partial class MainWindow : Window
             if (openBracket != -1 && closeBracket != -1)
             {
                 string skillName = key.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim();
-                var existing = _skills.FirstOrDefault(s => s.Key == skillName);
-                if (existing != null)
-                    existing.Value = value;
+                if (_skillsIndex.TryGetValue(skillName, out var existing))
+                {
+                    if (existing.Value != value) existing.Value = value;
+                }
                 else
-                    _skills.Add(new DataItem { Key = skillName, Value = value });
+                {
+                    var item = new DataItem { Key = skillName, Value = value };
+                    _skillsIndex[skillName] = item;
+                    _skills.Add(item);
+                }
 
                 int slash = value.IndexOf('/');
                 if (slash != -1)
@@ -1374,8 +1362,6 @@ public partial class MainWindow : Window
                 {
                     UpdatePlayerPrayer(value);
                 }
-
-                RefreshSkillsDisplay();
             }
         }
         catch { }
@@ -1394,7 +1380,6 @@ public partial class MainWindow : Window
                 if (int.TryParse(value.Trim(), out int xp))
                 {
                     SkillTrackerEngine.Instance.UpdateSkillXp(skillName, xp);
-                    RefreshSkillsDisplay();
                 }
             }
         }
@@ -1439,7 +1424,12 @@ public partial class MainWindow : Window
                     }
 
                     if (index < _npcs.Count)
+                    {
+                        var curr = _npcs[index];
+                        if (curr.Id == npc.Id && curr.Name == npc.Name && curr.Distance == npc.Distance && curr.Health == npc.Health && curr.Category == npc.Category)
+                            return;
                         _npcs[index] = npc;
+                    }
                     else
                         _npcs.Add(npc);
                 }
@@ -1461,7 +1451,12 @@ public partial class MainWindow : Window
                     }
 
                     if (index < _npcs.Count)
+                    {
+                        var curr = _npcs[index];
+                        if (curr.Id == npc.Id && curr.Name == npc.Name && curr.Distance == npc.Distance && curr.Health == npc.Health && curr.Category == npc.Category)
+                            return;
                         _npcs[index] = npc;
+                    }
                     else
                         _npcs.Add(npc);
                 }
@@ -1492,7 +1487,12 @@ public partial class MainWindow : Window
                         Status = parts[5].Trim()
                     };
                     if (index < _trees.Count)
+                    {
+                        var curr = _trees[index];
+                        if (curr.Id == tree.Id && curr.Name == tree.Name && curr.Distance == tree.Distance && curr.Location == tree.Location && curr.Status == tree.Status)
+                            return;
                         _trees[index] = tree;
+                    }
                     else
                         _trees.Add(tree);
                 }
@@ -1522,7 +1522,12 @@ public partial class MainWindow : Window
                         Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
                     };
                     if (index < _banks.Count)
+                    {
+                        var curr = _banks[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Distance == item.Distance && curr.Location == item.Location)
+                            return;
                         _banks[index] = item;
+                    }
                     else
                         _banks.Add(item);
                 }
@@ -1552,7 +1557,12 @@ public partial class MainWindow : Window
                         Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
                     };
                     if (index < _shops.Count)
+                    {
+                        var curr = _shops[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Distance == item.Distance && curr.Location == item.Location)
+                            return;
                         _shops[index] = item;
+                    }
                     else
                         _shops.Add(item);
                 }
@@ -1582,7 +1592,12 @@ public partial class MainWindow : Window
                         Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
                     };
                     if (index < _altars.Count)
+                    {
+                        var curr = _altars[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Distance == item.Distance && curr.Location == item.Location)
+                            return;
                         _altars[index] = item;
+                    }
                     else
                         _altars.Add(item);
                 }
@@ -1612,7 +1627,12 @@ public partial class MainWindow : Window
                         Location = $"({parts[3].Trim()}, {parts[4].Trim()})"
                     };
                     if (index < _rocks.Count)
+                    {
+                        var curr = _rocks[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Distance == item.Distance && curr.Location == item.Location)
+                            return;
                         _rocks[index] = item;
+                    }
                     else
                         _rocks.Add(item);
                 }
@@ -1643,7 +1663,12 @@ public partial class MainWindow : Window
                         Location = $"({parts[4].Trim()}, {parts[5].Trim()})"
                     };
                     if (index < _groundItems.Count)
+                    {
+                        var curr = _groundItems[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Quantity == item.Quantity && curr.Distance == item.Distance && curr.Location == item.Location)
+                            return;
                         _groundItems[index] = item;
+                    }
                     else
                         _groundItems.Add(item);
                 }
@@ -1672,7 +1697,12 @@ public partial class MainWindow : Window
                         Quantity = parts[2].Trim()
                     };
                     if (index < _bankItems.Count)
+                    {
+                        var curr = _bankItems[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Quantity == item.Quantity)
+                            return;
                         _bankItems[index] = item;
+                    }
                     else
                         _bankItems.Add(item);
                 }
@@ -1701,7 +1731,12 @@ public partial class MainWindow : Window
                         Quantity = parts[2].Trim()
                     };
                     if (index < _shopItems.Count)
+                    {
+                        var curr = _shopItems[index];
+                        if (curr.Id == item.Id && curr.Name == item.Name && curr.Quantity == item.Quantity)
+                            return;
                         _shopItems[index] = item;
+                    }
                     else
                         _shopItems.Add(item);
                 }
@@ -2392,7 +2427,12 @@ public partial class MainWindow : Window
                     };
 
                     if (index < _players.Count)
+                    {
+                        var curr = _players[index];
+                        if (curr.Id == player.Id && curr.Name == player.Name && curr.Distance == player.Distance && curr.CombatLevel == player.CombatLevel)
+                            return;
                         _players[index] = player;
+                    }
                     else
                         _players.Add(player);
                 }
@@ -2407,7 +2447,12 @@ public partial class MainWindow : Window
                     };
 
                     if (index < _players.Count)
+                    {
+                        var curr = _players[index];
+                        if (curr.Id == player.Id && curr.Name == player.Name && curr.Distance == player.Distance && curr.CombatLevel == player.CombatLevel)
+                            return;
                         _players[index] = player;
+                    }
                     else
                         _players.Add(player);
                 }
@@ -2569,6 +2614,10 @@ public partial class MainWindow : Window
             if (openBracket != -1 && closeBracket != -1)
             {
                 string slotId = key.Substring(openBracket + 1, closeBracket - openBracket - 1);
+                if (_lastEquipmentRaw.TryGetValue(slotId, out var lastVal) && lastVal == value)
+                    return;
+                _lastEquipmentRaw[slotId] = value;
+
                 if (_equipmentSlots.TryGetValue(slotId, out var border))
                 {
                     if (TryParseItemPayload(value, out int id, out string name, out int qty))
@@ -2633,57 +2682,64 @@ public partial class MainWindow : Window
             if (openBracket != -1 && closeBracket != -1)
             {
                 int index = int.Parse(key.Substring(openBracket + 1, closeBracket - openBracket - 1));
-                if (index >= 0 && index < 28 && _inventorySlots[index] != null)
+                if (index >= 0 && index < 28)
                 {
-                    if (TryParseItemPayload(value, out int id, out string name, out int qty))
+                    if (_lastInventoryRaw[index] == value)
+                        return;
+                    _lastInventoryRaw[index] = value;
+
+                    if (_inventorySlots[index] != null)
                     {
-                        var slotBorder = _inventorySlots[index];
-                        slotBorder.Background = new SolidColorBrush(Color.FromRgb(24, 48, 76));
-                        slotBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 180, 216));
-                        string qtyDisplay = qty > 1 ? $" (x{qty:N0})" : "";
-                        string idDisplay = id > 0 ? $" [ID: {id}]" : "";
-                        slotBorder.ToolTip = $"Slot {index + 1}: {name}{idDisplay}{qtyDisplay}";
-
-                        var cellGrid = new Grid();
-
-                        var nameText = new TextBlock
+                        if (TryParseItemPayload(value, out int id, out string name, out int qty))
                         {
-                            Text = name,
-                            FontSize = 8,
-                            FontWeight = FontWeights.SemiBold,
-                            Foreground = Brushes.White,
-                            TextWrapping = TextWrapping.Wrap,
-                            TextAlignment = TextAlignment.Center,
-                            HorizontalAlignment = HorizontalAlignment.Center,
-                            VerticalAlignment = VerticalAlignment.Center,
-                            Margin = new Thickness(2)
-                        };
-                        cellGrid.Children.Add(nameText);
+                            var slotBorder = _inventorySlots[index];
+                            slotBorder.Background = new SolidColorBrush(Color.FromRgb(24, 48, 76));
+                            slotBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 180, 216));
+                            string qtyDisplay = qty > 1 ? $" (x{qty:N0})" : "";
+                            string idDisplay = id > 0 ? $" [ID: {id}]" : "";
+                            slotBorder.ToolTip = $"Slot {index + 1}: {name}{idDisplay}{qtyDisplay}";
 
-                        if (qty > 1)
-                        {
-                            var qtyText = new TextBlock
+                            var cellGrid = new Grid();
+
+                            var nameText = new TextBlock
                             {
-                                Text = FormatItemQuantity(qty),
-                                FontSize = 7.5,
-                                FontWeight = FontWeights.Bold,
-                                Foreground = GetQuantityBrush(qty),
-                                HorizontalAlignment = HorizontalAlignment.Right,
-                                VerticalAlignment = VerticalAlignment.Top,
-                                Margin = new Thickness(0, 1, 2, 0)
+                                Text = name,
+                                FontSize = 8,
+                                FontWeight = FontWeights.SemiBold,
+                                Foreground = Brushes.White,
+                                TextWrapping = TextWrapping.Wrap,
+                                TextAlignment = TextAlignment.Center,
+                                HorizontalAlignment = HorizontalAlignment.Center,
+                                VerticalAlignment = VerticalAlignment.Center,
+                                Margin = new Thickness(2)
                             };
-                            cellGrid.Children.Add(qtyText);
-                        }
+                            cellGrid.Children.Add(nameText);
 
-                        slotBorder.Child = cellGrid;
-                    }
-                    else
-                    {
-                        var slotBorder = _inventorySlots[index];
-                        slotBorder.Background = new SolidColorBrush(Color.FromArgb(50, 30, 34, 42));
-                        slotBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(50, 55, 65));
-                        slotBorder.ToolTip = $"Slot {index + 1}: Empty";
-                        slotBorder.Child = null;
+                            if (qty > 1)
+                            {
+                                var qtyText = new TextBlock
+                                {
+                                    Text = FormatItemQuantity(qty),
+                                    FontSize = 7.5,
+                                    FontWeight = FontWeights.Bold,
+                                    Foreground = GetQuantityBrush(qty),
+                                    HorizontalAlignment = HorizontalAlignment.Right,
+                                    VerticalAlignment = VerticalAlignment.Top,
+                                    Margin = new Thickness(0, 1, 2, 0)
+                                };
+                                cellGrid.Children.Add(qtyText);
+                            }
+
+                            slotBorder.Child = cellGrid;
+                        }
+                        else
+                        {
+                            var slotBorder = _inventorySlots[index];
+                            slotBorder.Background = new SolidColorBrush(Color.FromArgb(50, 30, 34, 42));
+                            slotBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(50, 55, 65));
+                            slotBorder.ToolTip = $"Slot {index + 1}: Empty";
+                            slotBorder.Child = null;
+                        }
                     }
                 }
             }
@@ -2705,7 +2761,11 @@ public partial class MainWindow : Window
         });
     }
 
-    private void ClearLogs_Click(object sender, RoutedEventArgs e) => _dataItems.Clear();
+    private void ClearLogs_Click(object sender, RoutedEventArgs e)
+    {
+        _dataItemsIndex.Clear();
+        _dataItems.Clear();
+    }
 
     private void RestartHook_Click(object sender, RoutedEventArgs e)
     {
